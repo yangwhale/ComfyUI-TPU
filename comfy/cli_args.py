@@ -154,6 +154,14 @@ parser.add_argument("--multi-user", action="store_true", help="Enables per-user 
 parser.add_argument("--verbose", default='INFO', const='DEBUG', nargs="?", choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'], help='Set the logging level')
 parser.add_argument("--log-stdout", action="store_true", help="Send normal process output to stdout instead of stderr (default).")
 
+# XLA support arguments
+xla_group = parser.add_mutually_exclusive_group()
+xla_group.add_argument("--xla", action="store_true", help="To use the XLA devices for everything.")
+xla_group.add_argument("--xla_spmd", action="store_true", help="To use the XLA devices with SPMD/FSDPv2 for everything.")
+
+parser.add_argument("--xla_eager", action="store_true", help="Use XLA in eager mode")
+parser.add_argument("--xla_eager_compile", action="store_true", help="Use XLA in eager mode with compile")
+
 # The default built-in provider hosted under web/
 DEFAULT_VERSION_STRING = "comfyanonymous/ComfyUI@latest"
 

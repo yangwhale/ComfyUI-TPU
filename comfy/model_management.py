@@ -38,6 +38,7 @@ class CPUState(Enum):
     GPU = 0
     CPU = 1
     MPS = 2
+    XLA = 3
 
 # Determine VRAM State
 vram_state = VRAMState.NORMAL_VRAM
@@ -128,8 +129,76 @@ try:
 except:
     mlu_available = False
 
+try:
+    if args.xla or args.xla_spmd:
+        import torch_xla as xla
+        import torch_xla.core.xla_model as xm
+        from torch_xla import runtime as xr
+
+        xr.initialize_cache("/tmp")
+
+        cpu_state = CPUState.XLA
+        logging.info("Using XLA")
+
+    if args.xla_spmd:
+        import numpy as np
+        import torch_xla.distributed.spmd as xs
+
+        xr.use_spmd()
+
+        logging.info("Using XLA SPMD")
+
+        num_devices = xr.global_runtime_device_count()
+        mesh_shape = (num_devices, 1)
+        device_ids = np.array(range(num_devices))
+        # To be noted, the mesh must have an axis named 'fsdp', which the weights and activations will be sharded on.
+        mesh = xs.Mesh(device_ids, mesh_shape, ("fsdp", "model"))
+        xs.set_global_mesh(mesh)
+
+    if args.xla_eager or args.xla_eager_compile:
+        if not args.xla and not args.xla_spmd:
+            raise ValueError(
+                "XLA eager mode requires XLA or XLA SPMD mode to be enabled"
+            )
+        xla.experimental.eager_mode(True)
+        logging.info("Using XLA eager mode")
+
+except Exception as e:
+    pass
+
+try:
+    if args.xla_spmd:
+        # tpu-info is needed to track TPUs memory usage when using SPMD/FSDP mode
+        from tpu_info import device
+        from tpu_info import metrics
+except ImportError:
+    pass
+
 if args.cpu:
     cpu_state = CPUState.CPU
+
+def get_xla_memory_info(dev):
+    if args.xla_spmd:
+        mem_reserved, mem_total = 0, 0
+
+        chip_type, count = device.get_local_chips()
+        if not chip_type or not count:
+            raise RuntimeError("No TPU devices found.")
+
+        device_usage = metrics.get_chip_usage(chip_type)
+        for chip in device_usage:
+            mem_reserved += chip.memory_usage
+            mem_total += chip.total_memory
+
+        # Tested on TPU v3-8, given 8 cores, only 3/8 of the memory is available in SPMD mode
+        mem_reserved /= 3
+        mem_total /= 3
+    else:
+        # xm.get_memory_info(dev) only has bytes_limit and bytes_used
+        mem_info = xm.get_memory_info(dev)
+        mem_reserved = mem_info["bytes_used"]
+        mem_total = mem_info["bytes_limit"]
+    return (mem_reserved, mem_total)
 
 def is_intel_xpu():
     global cpu_state
@@ -161,6 +230,8 @@ def get_torch_device():
         return torch.device("mps")
     if cpu_state == CPUState.CPU:
         return torch.device("cpu")
+    if cpu_state == CPUState.XLA:
+        return xla.device()
     else:
         if is_intel_xpu():
             return torch.device("xpu", torch.xpu.current_device())
@@ -200,6 +271,8 @@ def get_total_memory(dev=None, torch_total_too=False):
             _, mem_total_mlu = torch.mlu.mem_get_info(dev)
             mem_total_torch = mem_reserved
             mem_total = mem_total_mlu
+        elif cpu_state == CPUState.XLA:
+            mem_total_torch, mem_total = get_xla_memory_info(dev)
         else:
             stats = torch.cuda.memory_stats(dev)
             mem_reserved = stats['reserved_bytes.all.current']
@@ -346,7 +419,7 @@ if lowvram_available:
         vram_state = set_vram_to
 
 
-if cpu_state != CPUState.GPU:
+if cpu_state != CPUState.GPU and cpu_state != CPUState.XLA:
     vram_state = VRAMState.DISABLED
 
 if cpu_state == CPUState.MPS:
@@ -1099,6 +1172,10 @@ def get_free_memory(dev=None, torch_free_too=False):
             mem_free_mlu, _ = torch.mlu.mem_get_info(dev)
             mem_free_torch = mem_reserved - mem_active
             mem_free_total = mem_free_mlu + mem_free_torch
+        elif cpu_state == CPUState.XLA:
+            mem_reserved, mem_total = get_xla_memory_info(dev)
+            mem_free_total = mem_total - mem_reserved
+            mem_free_torch = mem_free_total
         else:
             stats = torch.cuda.memory_stats(dev)
             mem_active = stats['active_bytes.all.current']
@@ -1111,6 +1188,10 @@ def get_free_memory(dev=None, torch_free_too=False):
         return (mem_free_total, mem_free_torch)
     else:
         return mem_free_total
+
+def xla_mode():
+    global cpu_state
+    return cpu_state == CPUState.XLA
 
 def cpu_mode():
     global cpu_state
@@ -1160,6 +1241,9 @@ def should_use_fp16(device=None, model_params=0, prioritize_performance=True, ma
         return True
 
     if cpu_mode():
+        return False
+        
+    if xla_mode():
         return False
 
     if is_intel_xpu():
@@ -1211,6 +1295,10 @@ def should_use_bf16(device=None, model_params=0, prioritize_performance=True, ma
         if is_device_cpu(device): #TODO ? bf16 works on CPU but is extremely slow
             return False
 
+    if device is not None:
+        if is_device_mps(device):
+            return True
+
     if FORCE_FP32:
         return False
 
@@ -1224,6 +1312,9 @@ def should_use_bf16(device=None, model_params=0, prioritize_performance=True, ma
 
     if cpu_mode():
         return False
+
+    if xla_mode():
+        return True
 
     if is_intel_xpu():
         return True
@@ -1257,6 +1348,9 @@ def should_use_bf16(device=None, model_params=0, prioritize_performance=True, ma
     return False
 
 def supports_fp8_compute(device=None):
+    if xla_mode():
+        return True
+
     if not is_nvidia():
         return False
 

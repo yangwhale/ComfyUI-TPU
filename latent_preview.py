@@ -89,6 +89,13 @@ def get_previewer(device, latent_format):
     return previewer
 
 def prepare_callback(model, steps, x0_output_dict=None):
+    if args.xla_spmd:
+        import torch_xla.distributed.spmd as xs
+        from torch_xla.experimental.spmd_fully_sharded_data_parallel import (
+            _prepare_spmd_partition_spec,
+            SpmdFullyShardedDataParallel as FSDPv2,
+        )
+
     preview_format = "JPEG"
     if preview_format not in ["JPEG", "PNG"]:
         preview_format = "JPEG"
@@ -96,6 +103,10 @@ def prepare_callback(model, steps, x0_output_dict=None):
     previewer = get_previewer(model.load_device, model.model.latent_format)
 
     pbar = comfy.utils.ProgressBar(steps)
+    
+    if args.xla_spmd and not isinstance(model.model.diffusion_model, FSDPv2):
+        model.model.diffusion_model = FSDPv2(model.model.diffusion_model)
+        
     def callback(step, x0, x, total_steps):
         if x0_output_dict is not None:
             x0_output_dict["x0"] = x0
@@ -103,6 +114,12 @@ def prepare_callback(model, steps, x0_output_dict=None):
         preview_bytes = None
         if previewer:
             preview_bytes = previewer.decode_latent_to_preview_image(preview_format, x0)
+            
+        if args.xla or args.xla_spmd:
+            import torch_xla as xla
+            logging.info(f"Step {step + 1}/{total_steps}")
+            xla.sync()
+            
         pbar.update_absolute(step + 1, total_steps, preview_bytes)
     return callback
 
