@@ -1,0 +1,2 @@
+# ComfyUI Manager Requirements for TPU
+comfyui_manager==4.0.4
