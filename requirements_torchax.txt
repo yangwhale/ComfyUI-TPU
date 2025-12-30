@@ -16,7 +16,7 @@ jax[tpu]>=0.4.20
 jaxlib>=0.4.20
 
 # Torchax - PyTorch on JAX
-torchax>=0.1.0
+torchax>=0.0.10
 
 # ============================================================================
 # PyTorch 依赖 (CPU 版本用于 Text Encoder)

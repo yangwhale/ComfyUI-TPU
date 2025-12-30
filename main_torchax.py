@@ -59,6 +59,12 @@ mesh = Mesh(mesh_utils.create_device_mesh((tp_dim,), allow_split_physical_axes=T
 print(f"[Torchax] 创建 Mesh: tp={tp_dim}")
 
 # ============================================================================
+# 在启用 torchax 之前先导入可能检查 CUDA 的模块
+# ============================================================================
+import torch
+import torchvision  # 必须在 torchax.enable_globally() 之前导入
+
+# ============================================================================
 # Torchax 初始化
 # ============================================================================
 import torchax
@@ -77,6 +83,21 @@ TORCHAX_MESH = mesh
 TORCHAX_MARK_SHARDING = mark_sharding
 
 print(f"[Torchax] Torchax 环境已初始化")
+
+# ============================================================================
+# 模块替换：在导入任何 comfy 模块之前替换 model_management
+# ============================================================================
+# 先导入 comfy 包
+import comfy
+
+# 导入 torchax 版本的 model_management
+from comfy import model_management_torchax
+
+# 替换 sys.modules 和 comfy 模块属性
+sys.modules['comfy.model_management'] = model_management_torchax
+comfy.model_management = model_management_torchax
+
+print("[Torchax] 已替换 model_management 为 TPU 版本")
 
 # ============================================================================
 # PyTree 注册 (支持 JAX 转换)
