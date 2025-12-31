@@ -3,6 +3,8 @@ __pycache__/
 /output/
 /input/
 !/input/example.png
+# Models directory (may be symlink to /dev/shm for TPU)
+/models
 /models/
 /temp/
 /custom_nodes/

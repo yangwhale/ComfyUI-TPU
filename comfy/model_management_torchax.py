@@ -216,10 +216,15 @@ def is_tpu():
     return tpu_available and JAX_AVAILABLE
 
 def get_tpu_device():
-    """Get the TPU XLA device for torchax."""
+    """Get the device for torchax TPU mode.
+    
+    Note: torchax works differently from torch-xla. It intercepts PyTorch
+    operations and runs them on JAX/TPU. We return CPU as the device for
+    weight storage, and torchax automatically handles TPU execution.
+    """
     if is_tpu():
-        # For torchax, we use 'xla' device type
-        return torch.device("xla")
+        # For torchax, we keep weights on CPU - torchax handles TPU execution
+        return torch.device("cpu")
     return None
 
 def get_tpu_mesh():
@@ -602,6 +607,30 @@ class LoadedModel:
         if is_intel_xpu() and not args.disable_ipex_optimize and 'ipex' in globals() and real_model is not None:
             with torch.no_grad():
                 real_model = ipex.optimize(real_model.eval(), inplace=True, graph_mode=True, concat_linear=True)
+
+        # TPU: 准备模型用于 TPU 执行
+        # 只对 diffusion model (Flux2/UNet) 做 TPU 转换，跳过 text encoder 和 VAE
+        if is_tpu() and real_model is not None:
+            model_name = real_model.__class__.__name__
+            
+            # 只对 diffusion model 做 TPU 优化
+            # 跳过 text encoder (包含 TE, TEModel, CLIP 等)
+            # 跳过 VAE
+            skip_models = ['TE', 'TEModel', 'CLIP', 'VAE', 'Encoder', 'Decoder', 'T5']
+            should_optimize = not any(skip_name in model_name for skip_name in skip_models)
+            
+            if should_optimize:
+                try:
+                    # 延迟导入避免循环依赖
+                    import sys
+                    main_torchax = sys.modules.get('__main__')
+                    if main_torchax is not None and hasattr(main_torchax, 'prepare_model_for_tpu'):
+                        real_model = main_torchax.prepare_model_for_tpu(real_model, model_name)
+                        logging.info(f"[TPU] 模型 {model_name} 已准备好用于 TPU 执行")
+                except Exception as e:
+                    logging.warning(f"[TPU] 准备模型时出错: {e}")
+            else:
+                logging.info(f"[TPU] 跳过 {model_name} 的 TPU 优化（text encoder/VAE 在 CPU 上运行）")
 
         self.real_model = weakref.ref(real_model)
         self.model_finalizer = weakref.finalize(real_model, cleanup_models)
@@ -1492,6 +1521,10 @@ def should_use_fp16(device=None, model_params=0, prioritize_performance=True, ma
     if torch.version.hip:
         return True
 
+    # TPU always supports fp16
+    if is_tpu() or (device is not None and is_device_tpu(device)):
+        return True
+
     props = torch.cuda.get_device_properties(device)
     if props.major >= 8:
         return True
@@ -1555,6 +1588,10 @@ def should_use_bf16(device=None, model_params=0, prioritize_performance=True, ma
     if is_ixuca():
         return True
 
+    # TPU always supports bf16 (native format)
+    if is_tpu() or (device is not None and is_device_tpu(device)):
+        return True
+
     if is_amd():
         arch = torch.cuda.get_device_properties(device).gcnArchName
         if any((a in arch) for a in AMD_RDNA2_AND_OLDER_ARCH):  # RDNA2 and older don't support bf16
@@ -1583,6 +1620,10 @@ def should_use_bf16(device=None, model_params=0, prioritize_performance=True, ma
 def supports_fp8_compute(device=None):
     if SUPPORT_FP8_OPS:
         return True
+
+    # TPU does not support fp8 compute
+    if is_tpu() or (device is not None and is_device_cpu(device)):
+        return False
 
     if not is_nvidia():
         return False

@@ -798,11 +798,17 @@ def unet_prefix_from_state_dict(state_dict):
     candidates = ["model.diffusion_model.", #ldm/sgm models
                   "model.model.", #audio models
                   "net.", #cosmos
+                  "", # no prefix (e.g., FLUX.2 bf16 from BFL)
                   ]
     counts = {k: 0 for k in candidates}
     for k in state_dict:
         for c in candidates:
-            if k.startswith(c):
+            if c == "":
+                # 空前缀: 检查是否以 known flux/dit keys 开头
+                if k.startswith("double_blocks.") or k.startswith("single_blocks.") or k.startswith("img_in.") or k.startswith("txt_in."):
+                    counts[c] += 1
+                    break
+            elif k.startswith(c):
                 counts[c] += 1
                 break
 

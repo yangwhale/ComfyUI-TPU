@@ -14,9 +14,12 @@ Usage:
 # ============================================================================
 import os
 import sys
+import functools
+import re
+import math
 
 # 设置 JAX 环境变量
-os.environ['JAX_PLATFORMS'] = 'tpu'  # 优先使用 TPU
+# 注意：不设置 JAX_PLATFORMS 以保留 CPU 后端，用于模型加载时的 jax.default_device("cpu")
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'  # 不预分配内存
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # 减少 TensorFlow 日志
 
@@ -69,6 +72,7 @@ import torchvision  # 必须在 torchax.enable_globally() 之前导入
 # ============================================================================
 import torchax
 from torchax import interop
+from torchax.ops import jaten, ops_registry
 
 # 全局启用 torchax
 torchax.enable_globally()
@@ -83,6 +87,249 @@ TORCHAX_MESH = mesh
 TORCHAX_MARK_SHARDING = mark_sharding
 
 print(f"[Torchax] Torchax 环境已初始化")
+
+# ============================================================================
+# Flux.2 Transformer 分片策略 (1D mesh: tp)
+# 规则：输出投影 ('tp', None)，输入投影 (None, 'tp')
+# 支持有/无 "diffusion_model." 前缀的权重
+# ============================================================================
+
+# 定义基础 patterns (不含前缀)
+_FLUX_BASE_SHARDINGS = {
+    # Double-stream Blocks - Attention
+    r'double_blocks\.\d+\.img_attn\.qkv\.weight': ('tp', None),
+    r'double_blocks\.\d+\.img_attn\.proj\.weight': (None, 'tp'),
+    r'double_blocks\.\d+\.txt_attn\.qkv\.weight': ('tp', None),
+    r'double_blocks\.\d+\.txt_attn\.proj\.weight': (None, 'tp'),
+    # Double-stream Blocks - MLP
+    r'double_blocks\.\d+\.img_mlp\.0\.weight': ('tp', None),
+    r'double_blocks\.\d+\.img_mlp\.2\.weight': (None, 'tp'),
+    r'double_blocks\.\d+\.txt_mlp\.0\.weight': ('tp', None),
+    r'double_blocks\.\d+\.txt_mlp\.2\.weight': (None, 'tp'),
+    # Single-stream Blocks
+    r'single_blocks\.\d+\.linear1\.weight': ('tp', None),
+    r'single_blocks\.\d+\.linear2\.weight': (None, 'tp'),
+    # Embedders & Projections
+    r'img_in\.weight': ('tp', None),
+    r'txt_in\.weight': ('tp', None),
+    r'final_layer\.linear\.weight': (None, 'tp'),
+    # Modulation
+    r'double_blocks\.\d+\.img_mod\.lin\.weight': ('tp', None),
+    r'double_blocks\.\d+\.txt_mod\.lin\.weight': ('tp', None),
+    r'single_blocks\.\d+\.modulation\.lin\.weight': ('tp', None),
+    # Time + Guidance Embedding
+    r'time_in\.in_layer\.weight': ('tp', None),
+    r'time_in\.out_layer\.weight': (None, 'tp'),
+    r'guidance_in\.in_layer\.weight': ('tp', None),
+    r'guidance_in\.out_layer\.weight': (None, 'tp'),
+    r'vector_in\.in_layer\.weight': ('tp', None),
+    r'vector_in\.out_layer\.weight': (None, 'tp'),
+    # FLUX.2 特有: global modulation
+    r'double_stream_modulation_img\.lin\.weight': ('tp', None),
+    r'double_stream_modulation_txt\.lin\.weight': ('tp', None),
+}
+
+# 创建完整 patterns (支持有/无 diffusion_model. 前缀)
+FLUX_TRANSFORMER_SHARDINGS = {}
+for pattern, sharding in _FLUX_BASE_SHARDINGS.items():
+    # 无前缀版本
+    FLUX_TRANSFORMER_SHARDINGS[pattern] = sharding
+    # 有前缀版本
+    FLUX_TRANSFORMER_SHARDINGS[r'diffusion_model\.' + pattern] = sharding
+
+# K 平滑以提高数值稳定性
+USE_K_SMOOTH = True
+
+# ============================================================================
+# Splash Attention 集成
+# ============================================================================
+
+from comfy.splash_attention_utils import sdpa_reference, tpu_splash_attention
+
+def override_op_definition(env, op, impl):
+    """在 torchax 环境中覆盖算子定义。"""
+    env._ops[op] = ops_registry.Operator(
+        op, impl, is_jax_function=False, is_user_defined=True,
+        needs_env=False, is_view_op=False,
+    )
+
+def torch_conv2d_jax(input, weight, bias=None, stride=1, padding=0,
+                     dilation=1, groups=1, *, env):
+    """JAX 兼容的 conv2d 覆盖实现。"""
+    jinput, jweight, jbias = env.t2j_iso((input, weight, bias))
+    res = jaten._aten_conv2d(jinput, jweight, jbias, stride, padding, dilation, groups)
+    return env.j2t_iso(res)
+
+def scaled_dot_product_attention_tpu(query, key, value, attn_mask=None, dropout_p=0.0,
+                                      is_causal=False, scale=None, enable_gqa=False,
+                                      env=None, mesh=None):
+    """SDPA 封装：长序列用 Splash Attention，短序列用参考实现。"""
+    # 对于长 KV 序列（self-attention）使用 TPU Splash Attention
+    if key.shape[2] > 20000:
+        assert attn_mask is None and dropout_p == 0.0 and not is_causal
+        assert not enable_gqa and scale is None
+        
+        jquery, jkey, jvalue = env.t2j_iso((query, key, value))
+        if USE_K_SMOOTH:
+            jkey = jkey - jnp.mean(jkey, axis=2, keepdims=True)
+        res = tpu_splash_attention(jquery, jkey, jvalue, mesh, scale=scale)
+        return env.j2t_iso(res)
+
+    # 短序列使用参考实现
+    return sdpa_reference(query, key, value, attn_mask, dropout_p, is_causal,
+                           scale, enable_gqa)
+
+# 注册自定义算子覆盖
+print("[Torchax] 注册 TPU 优化算子...")
+override_op_definition(env, torch.nn.functional.conv2d,
+                       functools.partial(torch_conv2d_jax, env=env))
+override_op_definition(env, torch.nn.functional.scaled_dot_product_attention,
+                       functools.partial(scaled_dot_product_attention_tpu, env=env, mesh=mesh))
+print("[Torchax] ✓ conv2d 和 scaled_dot_product_attention 已替换为 TPU 版本")
+
+# ============================================================================
+# TPU 模型转换工具函数
+# 参考: /home/chrisya/gpu-tpu-pedia/tpu/Flux.2/generate_diffusers_torchax_staged/utils.py
+#
+# 关键流程:
+# 1. move_module_to_xla() - 把权重转换为 torchax tensor
+# 2. torchax.compile() - 编译模型，生成 .params 和 .buffers 属性
+# 3. shard_weight_dict() - 对 .params/.buffers 用 apply_jax_ 分片到 TPU
+#
+# 注意：在 ComfyUI 中 torchax 是全局启用的，不能使用 jax.default_device("cpu")
+# 因为那会破坏 torchax 环境导致 "torchax Tensors can only do math within
+# the torchax environment" 错误
+# ============================================================================
+
+def move_module_to_xla(env, module):
+    """将模块权重移动到 XLA 设备。
+    
+    使用 cpu device context 确保初始转换在 CPU 内存中进行，
+    避免在分片之前占满 TPU HBM。
+    """
+    # 尝试在 CPU 上进行转换
+    try:
+        cpu_device = jax.devices('cpu')[0]
+        context = jax.default_device(cpu_device)
+    except:
+        context = None
+        
+    if context:
+        with context:
+            state_dict = module.state_dict()
+            state_dict = env.to_xla(state_dict)
+            module.load_state_dict(state_dict, assign=True)
+    else:
+        state_dict = module.state_dict()
+        state_dict = env.to_xla(state_dict)
+        module.load_state_dict(state_dict, assign=True)
+
+def shard_weight_dict(weight_dict, sharding_dict, mesh):
+    """按模式匹配应用权重分片。
+    
+    对已经是 torchax tensor 的权重，用 apply_jax_(jax.device_put, sharding)
+    分片并移动到 TPU。
+    """
+    import numpy as np
+    result = {}
+    sharded_count = 0
+    replicated_count = 0
+    sharded_bytes = 0
+    replicated_bytes = 0
+    
+    for k, v in weight_dict.items():
+        # 估算张量大小 (bfloat16 = 2 bytes)
+        if hasattr(v, 'shape'):
+            tensor_bytes = np.prod(v.shape) * 2
+        else:
+            tensor_bytes = 0
+        
+        matched = False
+        for pattern, sharding in sharding_dict.items():
+            if re.fullmatch(pattern, k) is not None:
+                v.apply_jax_(jax.device_put, NamedSharding(mesh, P(*sharding)))
+                matched = True
+                sharded_count += 1
+                sharded_bytes += tensor_bytes
+                break
+        if not matched:
+            # 未匹配的权重复制到所有设备
+            v.apply_jax_(jax.device_put, NamedSharding(mesh, P()))
+            replicated_count += 1
+            replicated_bytes += tensor_bytes
+        result[k] = v
+    
+    print(f"[Torchax]   分片统计: {sharded_count} 个分片 ({sharded_bytes/1e9:.2f}GB), "
+          f"{replicated_count} 个复制 ({replicated_bytes/1e9:.2f}GB)")
+    return result, sharded_count
+
+# 存储已编译的模型
+_compiled_models = {}
+_models_on_xla = set()
+
+def prepare_model_for_tpu(model, model_name="model"):
+    """准备模型用于 TPU 执行。
+    
+    完全遵循 generate_torchax.py 的流程:
+    1. move_module_to_xla() - 把权重转换为 torchax tensor
+    2. torchax.compile() - 编译模型，生成 .params 和 .buffers 属性
+    3. shard_weight_dict() - 对 .params/.buffers 用 apply_jax_ 分片到 TPU
+    
+    这是参考实现验证过的正确顺序。
+    """
+    global _compiled_models, _models_on_xla
+    
+    model_id = id(model)
+    
+    # 检查是否已处理过
+    if model_id in _models_on_xla:
+        print(f"[Torchax] 模型 {model_name} 已在 XLA 上")
+        return model
+    
+    print(f"[Torchax] 准备模型 {model_name} 用于 TPU...")
+    
+    # 强制 GC
+    import gc
+    gc.collect()
+    
+    # 打印 TPU 内存状态 (如果可能)
+    try:
+        for i, device in enumerate(jax.devices('tpu')):
+             stats = device.memory_stats()
+             if stats:
+                 bytes_in_use = stats.get('bytes_in_use', 0)
+                 bytes_limit = stats.get('bytes_limit', 0)
+                 print(f"[Torchax]   TPU {i} Mem: {bytes_in_use/1e9:.2f}GB / {bytes_limit/1e9:.2f}GB used")
+             break # 只打印第一个芯片
+    except Exception as e:
+        print(f"[Torchax]   无法获取 TPU 内存状态: {e}")
+
+    # 1. 移动权重到 XLA (转换为 torchax tensor)
+    print(f"[Torchax]   - 将权重移动到 XLA...")
+    move_module_to_xla(env, model)
+    
+    # 2. 编译模型 (生成 .params 和 .buffers 属性)
+    print(f"[Torchax]   - 编译模型...")
+    compiled_model = torchax.compile(model, torchax.CompileOptions(
+        jax_jit_kwargs={'static_argnames': ('return_dict',)}))
+    
+    # 3. 分片 params 和 buffers (用 apply_jax_ 移动到 TPU)
+    print(f"[Torchax]   - 分片权重到 {tp_dim} 个 TPU 核心...")
+    compiled_model.params, params_count = shard_weight_dict(
+        compiled_model.params, FLUX_TRANSFORMER_SHARDINGS, mesh)
+    compiled_model.buffers, buffers_count = shard_weight_dict(
+        compiled_model.buffers, FLUX_TRANSFORMER_SHARDINGS, mesh)
+    print(f"[Torchax]   - 分片了 {params_count} 个 params 和 {buffers_count} 个 buffers")
+    
+    _compiled_models[model_id] = compiled_model
+    _models_on_xla.add(model_id)
+    
+    print(f"[Torchax] ✓ 模型 {model_name} 已准备好用于 TPU")
+    return compiled_model
+
+def is_model_on_tpu(model):
+    """检查模型是否已在 TPU 上。"""
+    return id(model) in _models_on_xla
 
 # ============================================================================
 # 模块替换：在导入任何 comfy 模块之前替换 model_management

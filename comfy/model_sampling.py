@@ -154,11 +154,15 @@ class ModelSamplingDiscrete(torch.nn.Module):
 
     @property
     def sigma_min(self):
-        return self.sigmas[0]
+        # 转换为 Python float 以避免 torchax 环境问题
+        s = self.sigmas[0]
+        return float(s) if hasattr(s, 'item') else s
 
     @property
     def sigma_max(self):
-        return self.sigmas[-1]
+        # 转换为 Python float 以避免 torchax 环境问题
+        s = self.sigmas[-1]
+        return float(s) if hasattr(s, 'item') else s
 
     def timestep(self, sigma):
         log_sigma = sigma.log()
@@ -210,11 +214,15 @@ class ModelSamplingContinuousEDM(torch.nn.Module):
 
     @property
     def sigma_min(self):
-        return self.sigmas[0]
+        # 转换为 Python float 以避免 torchax 环境问题
+        s = self.sigmas[0]
+        return float(s) if hasattr(s, 'item') else s
 
     @property
     def sigma_max(self):
-        return self.sigmas[-1]
+        # 转换为 Python float 以避免 torchax 环境问题
+        s = self.sigmas[-1]
+        return float(s) if hasattr(s, 'item') else s
 
     def timestep(self, sigma):
         return 0.25 * sigma.log()
@@ -264,11 +272,15 @@ class ModelSamplingDiscreteFlow(torch.nn.Module):
 
     @property
     def sigma_min(self):
-        return self.sigmas[0]
+        # 转换为 Python float 以避免 torchax 环境问题
+        s = self.sigmas[0]
+        return float(s) if hasattr(s, 'item') else s
 
     @property
     def sigma_max(self):
-        return self.sigmas[-1]
+        # 转换为 Python float 以避免 torchax 环境问题
+        s = self.sigmas[-1]
+        return float(s) if hasattr(s, 'item') else s
 
     def timestep(self, sigma):
         return sigma * self.multiplier
@@ -357,11 +369,15 @@ class ModelSamplingFlux(torch.nn.Module):
 
     @property
     def sigma_min(self):
-        return self.sigmas[0]
+        # 转换为 Python float 以避免 torchax 环境问题
+        s = self.sigmas[0]
+        return float(s) if hasattr(s, 'item') else s
 
     @property
     def sigma_max(self):
-        return self.sigmas[-1]
+        # 转换为 Python float 以避免 torchax 环境问题
+        s = self.sigmas[-1]
+        return float(s) if hasattr(s, 'item') else s
 
     def timestep(self, sigma):
         return sigma
