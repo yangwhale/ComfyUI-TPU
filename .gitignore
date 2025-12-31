@@ -25,3 +25,6 @@ web_custom_versions/
 openapi.yaml
 filtered-openapi.yaml
 uv.lock
+
+# Models directory (use symlink locally)
+models/
