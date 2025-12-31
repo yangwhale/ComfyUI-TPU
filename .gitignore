@@ -27,4 +27,10 @@ filtered-openapi.yaml
 uv.lock
 
 # Models directory (use symlink locally)
-models/
+
+# Ignore actual model files, keep placeholders
+models/**/*.bin
+models/**/*.safetensors
+models/**/*.ckpt
+models/**/*.pth
+models/**/*.pt
