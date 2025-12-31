@@ -1,52 +1,27 @@
-#!/usr/bin/env python3
 """
-Flux.2 三阶段生成 - 共享工具模块
+ComfyUI Flux.2 TPU - 工具模块
+============================
 
-包含配置常量、分片策略、数据存储和辅助函数。
+包含:
+  - 分片策略配置
+  - 权重分片函数
+  - PyTree 注册
+  - JAX 配置
 """
 
-import json
-import os
 import re
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 import torch
 from jax.sharding import NamedSharding, PartitionSpec as P
 from jax.tree_util import register_pytree_node
-from safetensors import safe_open
-from safetensors.torch import load_file as torch_load_file
-from safetensors.torch import save_file as torch_save_file
-
-# ============================================================================
-# 配置常量
-# ============================================================================
-
-MODEL_NAME = "black-forest-labs/FLUX.2-dev"
-WIDTH, HEIGHT = 1024, 1024
-NUM_STEPS = 50
-GUIDANCE_SCALE = 4.0  # Embedded CFG
-USE_K_SMOOTH = True
-
-DEFAULT_PROMPT = (
-    "Realistic macro photograph of a hermit crab using a soda can as its shell, "
-    "partially emerging from the can, captured with sharp detail and natural colors, "
-    "on a sunlit beach with soft shadows and a shallow depth of field, "
-    "with blurred ocean waves in the background. "
-    "The can has the text `BFL Diffusers` on it and it has a color gradient "
-    "that start with #FF5733 at the top and transitions to #33FF57 at the bottom."
-)
-
-# Flux.2 pipeline 使用的 system message（来自 diffusers/pipelines/flux2/system_messages.py）
-SYSTEM_MESSAGE = """You are an AI that reasons about image descriptions. You give structured responses focusing on object relationships, object
-attribution and actions without speculation."""
 
 
 # ============================================================================
-# Transformer 分片策略 (1D mesh: tp)
+# Transformer 分片策略
+# ============================================================================
 # 规则：输出投影 ('tp', None)，输入投影 (None, 'tp')
-# ============================================================================
 
 TRANSFORMER_SHARDINGS = {
     # Double-stream Blocks - Attention
@@ -91,7 +66,18 @@ VAE_DECODER_SHARDINGS = {}
 # ============================================================================
 
 def shard_weight_dict(weight_dict, sharding_dict, mesh, debug=False):
-    """按模式匹配应用权重分片。"""
+    """
+    按模式匹配应用权重分片。
+    
+    Args:
+        weight_dict: 权重字典 {name: tensor}
+        sharding_dict: 分片规则 {pattern: (axis0, axis1)}
+        mesh: JAX Mesh
+        debug: 是否打印详细信息
+    
+    Returns:
+        分片后的权重字典
+    """
     result = {}
     sharded_count = replicated_count = 0
     sharded_bytes = replicated_bytes = 0
@@ -104,8 +90,8 @@ def shard_weight_dict(weight_dict, sharding_dict, mesh, debug=False):
                 v = v.to("jax")
         
         matched = False
-        for target, sharding in sharding_dict.items():
-            if re.fullmatch(target, k) is not None:
+        for pattern, sharding in sharding_dict.items():
+            if re.fullmatch(pattern, k) is not None:
                 v.apply_jax_(jax.device_put, NamedSharding(mesh, P(*sharding)))
                 matched = True
                 sharded_count += 1
@@ -127,7 +113,13 @@ def shard_weight_dict(weight_dict, sharding_dict, mesh, debug=False):
 
 
 def move_module_to_xla(env, module):
-    """将模块权重转换为 torchax tensor 格式。"""
+    """
+    将 PyTorch 模块权重转换为 torchax tensor。
+    
+    Args:
+        env: torchax 环境
+        module: PyTorch 模块
+    """
     with jax.default_device("cpu"):
         state_dict = module.state_dict()
         state_dict = env.to_xla(state_dict)
@@ -139,9 +131,16 @@ def move_module_to_xla(env, module):
 # ============================================================================
 
 def setup_pytree_registrations():
-    """注册必要的 PyTree 节点以支持 JAX 转换。"""
-    from diffusers.models.autoencoders import vae as diffusers_vae
+    """
+    注册必要的 PyTree 节点以支持 JAX 转换。
+    
+    注册的类型:
+      - BaseModelOutputWithPastAndCrossAttentions (transformers)
+      - DecoderOutput (diffusers VAE)
+      - AutoencoderKLOutput (diffusers VAE)
+    """
     from diffusers.models import modeling_outputs as diffusers_modeling_outputs
+    from diffusers.models.autoencoders import vae as diffusers_vae
     from transformers import modeling_outputs
     
     print("注册 PyTree 节点...")
@@ -167,130 +166,12 @@ def setup_pytree_registrations():
 
 
 # ============================================================================
-# SafeTensors 数据存储
-# ============================================================================
-
-def save_embeddings_to_safetensors(embeddings_dict, output_path, metadata=None):
-    """将 embeddings 字典保存为 SafeTensors 格式。"""
-    tensors_to_save = {}
-    dtype_info = {}
-    
-    for key, value in embeddings_dict.items():
-        if isinstance(value, torch.Tensor):
-            if value.dtype == torch.bfloat16:
-                tensors_to_save[key] = value.to(torch.float32).cpu()
-                dtype_info[key] = 'bfloat16'
-            else:
-                tensors_to_save[key] = value.cpu()
-                dtype_info[key] = str(value.dtype)
-        elif isinstance(value, (np.ndarray, jnp.ndarray)):
-            np_array = np.array(value)
-            if 'bfloat16' in str(value.dtype):
-                tensors_to_save[key] = torch.from_numpy(np_array.astype(np.float32))
-                dtype_info[key] = 'bfloat16'
-            else:
-                tensors_to_save[key] = torch.from_numpy(np_array)
-                dtype_info[key] = str(np_array.dtype)
-    
-    final_metadata = metadata or {}
-    final_metadata['dtype_info'] = json.dumps(dtype_info)
-    torch_save_file(tensors_to_save, output_path, metadata=final_metadata)
-    print(f"✓ 已保存 {len(tensors_to_save)} 个 tensors 到 {output_path}")
-    return output_path
-
-
-def load_embeddings_from_safetensors(input_path, device='cpu', restore_dtype=True):
-    """从 SafeTensors 文件加载 embeddings。"""
-    tensors = torch_load_file(input_path, device=device)
-    
-    metadata = {}
-    dtype_info = {}
-    with safe_open(input_path, framework="pt") as f:
-        raw_metadata = f.metadata()
-        if raw_metadata:
-            metadata = dict(raw_metadata)
-            if 'dtype_info' in metadata:
-                dtype_info = json.loads(metadata['dtype_info'])
-    
-    if restore_dtype:
-        for key in tensors:
-            if key in dtype_info and dtype_info[key] == 'bfloat16':
-                tensors[key] = tensors[key].to(torch.bfloat16)
-    
-    print(f"✓ 已加载 {len(tensors)} 个 tensors 从 {input_path}")
-    return tensors, metadata
-
-
-def save_latents_to_safetensors(latents, output_path, metadata=None):
-    """将 latents 保存为 SafeTensors 格式。"""
-    tensors_to_save = {}
-    dtype_info = {}
-    
-    if isinstance(latents, torch.Tensor):
-        tensors_to_save['latents'] = latents.cpu().contiguous()
-        dtype_info['latents'] = str(latents.dtype)
-    elif isinstance(latents, jnp.ndarray) or 'ArrayImpl' in str(type(latents)):
-        if latents.dtype == jnp.bfloat16:
-            np_array = np.array(latents.astype(jnp.float32))
-            tensors_to_save['latents'] = torch.from_numpy(np_array).to(torch.bfloat16)
-        else:
-            np_array = np.array(latents)
-            tensors_to_save['latents'] = torch.from_numpy(np_array).contiguous()
-        dtype_info['latents'] = str(latents.dtype)
-    else:
-        raise TypeError(f"Unsupported latents type: {type(latents)}")
-    
-    final_metadata = metadata or {}
-    final_metadata['dtype_info'] = json.dumps(dtype_info)
-    torch_save_file(tensors_to_save, output_path, metadata=final_metadata)
-    print(f"✓ 已保存 latents 到 {output_path}, shape: {tensors_to_save['latents'].shape}")
-    return output_path
-
-
-def load_latents_from_safetensors(input_path, device='cpu', restore_dtype=True):
-    """从 SafeTensors 文件加载 latents。"""
-    tensors, metadata = load_embeddings_from_safetensors(input_path, device, restore_dtype)
-    latents = tensors['latents']
-    print(f"  latents shape: {latents.shape}, dtype: {latents.dtype}")
-    return latents, metadata
-
-
-# ============================================================================
-# 配置管理
-# ============================================================================
-
-def save_generation_config(config_dict, output_path):
-    """保存生成配置到 JSON 文件。"""
-    with open(output_path, 'w') as f:
-        json.dump(config_dict, f, indent=2)
-    print(f"✓ 已保存配置到 {output_path}")
-
-
-def load_generation_config(input_path):
-    """从 JSON 文件加载生成配置。"""
-    with open(input_path, 'r') as f:
-        config = json.load(f)
-    print(f"✓ 已加载配置从 {input_path}")
-    return config
-
-
-def get_default_paths(output_dir="./stage_outputs"):
-    """获取默认的中间文件路径。"""
-    os.makedirs(output_dir, exist_ok=True)
-    return {
-        'embeddings': os.path.join(output_dir, 'stage1_embeddings.safetensors'),
-        'latents': os.path.join(output_dir, 'stage2_latents.safetensors'),
-        'config': os.path.join(output_dir, 'generation_config.json'),
-        'image': os.path.join(output_dir, 'output_image.png'),
-    }
-
-
-# ============================================================================
 # JAX 配置
 # ============================================================================
 
 def setup_jax_cache():
-    """设置 JAX 编译缓存。"""
+    """设置 JAX 编译缓存以加速后续编译。"""
+    import os
     cache_dir = os.path.expanduser("~/.cache/jax_cache")
     jax.config.update("jax_compilation_cache_dir", cache_dir)
     jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
