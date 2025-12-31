@@ -50,9 +50,14 @@ def _register_operators_on_env(env, mesh_obj):
     
     注册的算子:
       - conv2d: 2D 卷积
+      - cartesian_prod: 笛卡尔积
+      - chunk: 张量分块
       - layer_norm / native_layer_norm: 层归一化
+      - unflatten: 维度展开
+      - rms_norm: RMS 归一化
+      - dropout / native_dropout: Dropout（推理时直接返回）
       - group_norm / native_group_norm: 组归一化
-      - scaled_dot_product_attention: Splash Attention
+      - scaled_dot_product_attention: Splash Attention（可选）
     """
     
     def override_op(op, impl):
@@ -70,6 +75,46 @@ def _register_operators_on_env(env, mesh_obj):
         return env.j2t_iso(res)
     
     override_op(torch.nn.functional.conv2d, functools.partial(conv2d_impl, env=env))
+    
+    # ---- cartesian_prod ----
+    def cartesian_prod_impl(tensors, env=env):
+        if len(tensors) == 0:
+            return env.j2t_iso(jnp.empty((0, 0)))
+        if len(tensors) == 1:
+            jt = env.t2j_iso(tensors[0])
+            return env.j2t_iso(jnp.expand_dims(jt, axis=1))
+        jarrays = [env.t2j_iso(t) for t in tensors]
+        grids = jnp.meshgrid(*jarrays, indexing='ij')
+        result = jnp.stack([g.ravel() for g in grids], axis=-1)
+        return env.j2t_iso(result)
+    
+    try:
+        override_op(torch.ops.aten.cartesian_prod.default, functools.partial(cartesian_prod_impl, env=env))
+    except Exception:
+        pass
+    
+    # ---- chunk ----
+    def chunk_impl(input, chunks, dim=0, env=env):
+        jinput = env.t2j_iso(input)
+        if dim < 0:
+            dim = len(jinput.shape) + dim
+        size = jinput.shape[dim]
+        chunk_size = (size + chunks - 1) // chunks
+        splits = []
+        for i in range(chunks):
+            start = i * chunk_size
+            end = min((i + 1) * chunk_size, size)
+            if start >= size:
+                break
+            slices = [slice(None)] * len(jinput.shape)
+            slices[dim] = slice(start, end)
+            splits.append(env.j2t_iso(jinput[tuple(slices)]))
+        return splits
+    
+    try:
+        override_op(torch.ops.aten.chunk.default, functools.partial(chunk_impl, env=env))
+    except Exception:
+        pass
     
     # ---- layer_norm ----
     def layer_norm_impl(input, normalized_shape, weight=None, bias=None, eps=1e-5, env=env):
@@ -108,6 +153,72 @@ def _register_operators_on_env(env, mesh_obj):
     try:
         override_op(torch.ops.aten.layer_norm.default, functools.partial(layer_norm_impl, env=env))
         override_op(torch.ops.aten.native_layer_norm.default, functools.partial(native_layer_norm_impl, env=env))
+    except Exception:
+        pass
+    
+    # ---- unflatten ----
+    def unflatten_impl(input, dim, sizes, env=env):
+        jinput = env.t2j_iso(input)
+        shape = list(jinput.shape)
+        if dim < 0:
+            dim = len(shape) + dim
+        
+        sizes = list(sizes)
+        if -1 in sizes:
+            neg_idx = sizes.index(-1)
+            known_prod = 1
+            for i, s in enumerate(sizes):
+                if i != neg_idx:
+                    known_prod *= s
+            sizes[neg_idx] = shape[dim] // known_prod
+        
+        new_shape = shape[:dim] + sizes + shape[dim+1:]
+        return env.j2t_iso(jnp.reshape(jinput, new_shape))
+    
+    try:
+        override_op(torch.ops.aten.unflatten.int, functools.partial(unflatten_impl, env=env))
+    except Exception:
+        pass
+    
+    # ---- rms_norm ----
+    def rms_norm_impl(input, normalized_shape, weight=None, eps=1e-6, env=env):
+        jinput = env.t2j_iso(input)
+        jweight = env.t2j_iso(weight) if weight is not None else None
+        
+        axis = tuple(range(-len(normalized_shape), 0))
+        rms = jnp.sqrt(jnp.mean(jinput ** 2, axis=axis, keepdims=True) + eps)
+        result = jinput / rms
+        
+        if jweight is not None:
+            result = result * jweight
+        return env.j2t_iso(result)
+    
+    try:
+        override_op(torch.ops.aten.rms_norm.default, functools.partial(rms_norm_impl, env=env))
+        override_op(torch.rms_norm, functools.partial(rms_norm_impl, env=env))
+    except Exception:
+        pass
+    
+    # ---- dropout ----
+    def dropout_impl(input, p=0.5, training=False, inplace=False, env=env):
+        if not training or p == 0:
+            return input
+        jinput = env.t2j_iso(input)
+        key = jax.random.PRNGKey(42)
+        mask = jax.random.bernoulli(key, 1 - p, shape=jinput.shape)
+        return env.j2t_iso(jinput * mask / (1 - p))
+    
+    def native_dropout_impl(input, p, train, env=env):
+        if not train or p == 0:
+            return input, torch.ones_like(input, dtype=torch.bool)
+        jinput = env.t2j_iso(input)
+        key = jax.random.PRNGKey(42)
+        mask = jax.random.bernoulli(key, 1 - p, shape=jinput.shape)
+        return env.j2t_iso(jinput * mask / (1 - p)), env.j2t_iso(mask.astype(jnp.bool_))
+    
+    try:
+        override_op(torch.ops.aten.dropout.default, functools.partial(dropout_impl, env=env))
+        override_op(torch.ops.aten.native_dropout.default, functools.partial(native_dropout_impl, env=env))
     except Exception:
         pass
     
