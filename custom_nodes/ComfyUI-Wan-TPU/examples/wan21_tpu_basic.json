@@ -38,7 +38,7 @@
       "id": 2,
       "type": "Wan21TPUSampler",
       "pos": [550, 200],
-      "size": [300, 300],
+      "size": [350, 380],
       "flags": {},
       "order": 1,
       "mode": 0,
@@ -72,21 +72,22 @@
         "Node name for S&R": "Wan21TPUSampler"
       },
       "widgets_values": [
-        720,
-        1280,
+        480,
+        832,
         81,
         50,
         5.0,
         2025,
+        "fixed",
         "Wan-AI/Wan2.1-T2V-14B-Diffusers",
-        5.0
+        3.0
       ]
     },
     {
       "id": 3,
       "type": "Wan21TPUVAEDecoder",
-      "pos": [900, 200],
-      "size": [250, 150],
+      "pos": [950, 200],
+      "size": [300, 150],
       "flags": {},
       "order": 2,
       "mode": 0,
@@ -122,7 +123,7 @@
     {
       "id": 4,
       "type": "PreviewImage",
-      "pos": [1200, 200],
+      "pos": [1300, 200],
       "size": [400, 400],
       "flags": {},
       "order": 3,
@@ -151,7 +152,7 @@
   "config": {},
   "extra": {
     "ds": {
-      "scale": 1,
+      "scale": 0.8,
       "offset": [0, 0]
     }
   },
