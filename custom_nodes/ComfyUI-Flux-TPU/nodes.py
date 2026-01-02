@@ -28,6 +28,25 @@ import torch
 from jax.experimental import mesh_utils
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+# ComfyUI progress bar and server
+try:
+    from comfy.utils import ProgressBar
+    from server import PromptServer
+    _HAS_SERVER = True
+except ImportError:
+    # 独立运行时的 fallback
+    class ProgressBar:
+        def __init__(self, total, node_id=None):
+            self.total = total
+            self.current = 0
+            self.node_id = node_id
+        def update(self, n=1):
+            self.current += n
+        def update_absolute(self, value, total=None, preview=None):
+            self.current = value
+    PromptServer = None
+    _HAS_SERVER = False
+
 # 延迟导入 utils（支持独立测试）
 try:
     from .utils import (
@@ -409,6 +428,7 @@ def _register_operators_on_env(env, mesh_obj):
 _torchax_env = None
 _ops_registered = False
 _globally_enabled = False
+_jax_cache_initialized = False
 
 
 def ensure_torchax_enabled(mesh_obj=None):
@@ -419,9 +439,15 @@ def ensure_torchax_enabled(mesh_obj=None):
     - 首次调用时 enable_globally()，之后保持启用
     - 这样缓存的 XLA 模型权重可以在后续调用中正常工作
     - 节点返回值必须转为 CPU tensor（由各节点负责）
+    - 初始化 JAX 编译缓存以加速后续编译
     """
-    global _torchax_env, _ops_registered, _globally_enabled
+    global _torchax_env, _ops_registered, _globally_enabled, _jax_cache_initialized
     import torchax
+    
+    # 首次调用时设置 JAX 编译缓存
+    if not _jax_cache_initialized:
+        setup_jax_cache()
+        _jax_cache_initialized = True
     
     # 首次调用时全局启用
     if not _globally_enabled:
@@ -577,6 +603,9 @@ class Flux2TPUSampler:
             },
             "optional": {
                 "model_id": ("STRING", {"default": "black-forest-labs/FLUX.2-dev"}),
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
             }
         }
     
@@ -585,7 +614,8 @@ class Flux2TPUSampler:
     CATEGORY = "TPU/Flux.2"
     
     def sample(self, prompt_embeds, height, width, num_inference_steps,
-               guidance_scale, seed, model_id="black-forest-labs/FLUX.2-dev"):
+               guidance_scale, seed, model_id="black-forest-labs/FLUX.2-dev",
+               unique_id=None):
         """
         运行 Transformer 推理生成 latents（Hybrid 方案）
         """
@@ -603,12 +633,57 @@ class Flux2TPUSampler:
         generator = torch.Generator()
         generator.manual_seed(seed)
         
+        # 创建 ComfyUI 进度条
+        pbar = ProgressBar(num_inference_steps)
+        
+        # 用于计算每步时间和 ETA 的状态
+        step_times = []
+        loop_start_time = [None]  # 使用列表以便在闭包中修改
+        
+        def progress_callback(pipe, step_index, timestep, callback_kwargs):
+            """每一步更新进度条和显示时间信息"""
+            current_time = time.perf_counter()
+            
+            # 计算当前步耗时
+            if loop_start_time[0] is not None:
+                step_time = current_time - loop_start_time[0]
+                step_times.append(step_time)
+            loop_start_time[0] = current_time
+            
+            # 更新进度条
+            pbar.update(1)
+            
+            # 如果有 PromptServer 且有 unique_id，发送进度文本
+            if _HAS_SERVER and unique_id is not None and len(step_times) > 0:
+                # 计算平均每步时间
+                avg_step_time = sum(step_times) / len(step_times)
+                # 已完成步数（step_index 是 0-based，callback 在步完成后调用）
+                completed_steps = step_index + 1
+                remaining_steps = num_inference_steps - completed_steps
+                eta_seconds = remaining_steps * avg_step_time
+                
+                # 格式化 ETA
+                if eta_seconds >= 60:
+                    eta_str = f"{int(eta_seconds // 60)}m {int(eta_seconds % 60)}s"
+                else:
+                    eta_str = f"{eta_seconds:.1f}s"
+                
+                # 发送进度文本到 UI
+                progress_text = f"Step {completed_steps}/{num_inference_steps} | {step_times[-1]:.2f}s/step | ETA: {eta_str}"
+                try:
+                    PromptServer.instance.send_progress_text(progress_text, unique_id)
+                except Exception:
+                    pass  # 忽略发送失败
+            
+            return callback_kwargs
+        
         # Hybrid 方案：enable_globally() 已激活，只需 with mesh: 用于 sharding context
         with real_mesh:
             prompt_embeds_xla = prompt_embeds.to('jax')
             
             print(f"  Running denoising loop...")
             start_time = time.perf_counter()
+            loop_start_time[0] = start_time  # 初始化循环开始时间
             
             result = pipe(
                 prompt=None,
@@ -619,11 +694,22 @@ class Flux2TPUSampler:
                 guidance_scale=guidance_scale,
                 generator=generator,
                 output_type='latent',
+                callback_on_step_end=progress_callback,
             )
             jax.effects_barrier()
             
             elapsed = time.perf_counter() - start_time
             print(f"  Done: {elapsed:.2f}s ({elapsed/num_inference_steps:.2f}s/step)")
+            
+            # 发送完成消息
+            if _HAS_SERVER and unique_id is not None:
+                try:
+                    PromptServer.instance.send_progress_text(
+                        f"Complete! Total: {elapsed:.2f}s ({elapsed/num_inference_steps:.2f}s/step)",
+                        unique_id
+                    )
+                except Exception:
+                    pass
             
             # 转换 latents 为 CPU tensor（返回给 ComfyUI）
             torch_latents = self._to_cpu_tensor(result.images)

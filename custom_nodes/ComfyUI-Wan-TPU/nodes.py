@@ -29,6 +29,25 @@ import torch
 from jax.experimental import mesh_utils
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+# ComfyUI progress bar and server
+try:
+    from comfy.utils import ProgressBar
+    from server import PromptServer
+    _HAS_SERVER = True
+except ImportError:
+    # 独立运行时的 fallback
+    class ProgressBar:
+        def __init__(self, total, node_id=None):
+            self.total = total
+            self.current = 0
+            self.node_id = node_id
+        def update(self, n=1):
+            self.current += n
+        def update_absolute(self, value, total=None, preview=None):
+            self.current = value
+    PromptServer = None
+    _HAS_SERVER = False
+
 # Hybrid 方案：使用 enable_globally() 保持 Mode 栈激活
 # 这样缓存的 XLA 模型可以在后续调用中正常工作
 
@@ -46,6 +65,7 @@ try:
         move_module_to_xla,
         prepare_video_for_export,
         shard_weight_dict,
+        setup_jax_cache,
     )
 except ImportError:
     # 独立运行时使用本地定义 - 使用完整的 regex 模式
@@ -177,6 +197,15 @@ except ImportError:
         video_np = np.clip(video_np, 0, 1)
         
         return video_np.astype(np.float32)
+    
+    def setup_jax_cache():
+        """设置 JAX 编译缓存以加速后续编译。"""
+        import os
+        cache_dir = os.path.expanduser("~/.cache/jax_cache")
+        jax.config.update("jax_compilation_cache_dir", cache_dir)
+        jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+        jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+        print(f"✓ JAX 编译缓存: {cache_dir}")
 
 # 全局 mesh（延迟创建）
 _mesh = None
@@ -793,6 +822,7 @@ def _register_operators_on_env(env, mesh_obj):
 _torchax_env = None
 _ops_registered = False
 _globally_enabled = False
+_jax_cache_initialized = False
 
 
 def ensure_torchax_enabled(mesh_obj=None):
@@ -803,9 +833,15 @@ def ensure_torchax_enabled(mesh_obj=None):
     - 首次调用时 enable_globally()，之后保持启用
     - 这样缓存的 XLA 模型权重可以在后续调用中正常工作
     - 节点返回值必须转为 CPU tensor（由各节点负责）
+    - 初始化 JAX 编译缓存以加速后续编译
     """
-    global _torchax_env, _ops_registered, _globally_enabled
+    global _torchax_env, _ops_registered, _globally_enabled, _jax_cache_initialized
     import torchax
+    
+    # 首次调用时设置 JAX 编译缓存
+    if not _jax_cache_initialized:
+        setup_jax_cache()
+        _jax_cache_initialized = True
     
     # 首次调用时全局启用
     if not _globally_enabled:
@@ -1166,6 +1202,9 @@ class Wan21TPUSampler:
             "optional": {
                 "model_id": ("STRING", {"default": "Wan-AI/Wan2.1-T2V-14B-Diffusers"}),
                 "flow_shift": ("FLOAT", {"default": DEFAULT_FLOW_SHIFT, "min": 1.0, "max": 10.0, "step": 0.5}),
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
             }
         }
     
@@ -1176,7 +1215,8 @@ class Wan21TPUSampler:
     
     def sample(self, prompt_embeds, negative_prompt_embeds, height, width, num_frames,
                num_inference_steps, guidance_scale, seed,
-               model_id="Wan-AI/Wan2.1-T2V-14B-Diffusers", flow_shift=DEFAULT_FLOW_SHIFT):
+               model_id="Wan-AI/Wan2.1-T2V-14B-Diffusers", flow_shift=DEFAULT_FLOW_SHIFT,
+               unique_id=None):
         """
         运行 Transformer 推理生成 latents（Hybrid 方案）
         """
@@ -1200,15 +1240,52 @@ class Wan21TPUSampler:
         print(f"引导尺度: {guidance_scale}")
         
         # 创建 ComfyUI 进度条
-        import comfy.utils
-        pbar = comfy.utils.ProgressBar(num_inference_steps)
+        pbar = ProgressBar(num_inference_steps)
+        
+        # 用于计算每步时间和 ETA 的状态
+        step_times = []
+        loop_start_time = [None]  # 使用列表以便在闭包中修改
         
         # 进度回调函数
         def progress_callback(pipe, step_index, timestep, callback_kwargs):
+            """每一步更新进度条和显示时间信息"""
+            current_time = time.perf_counter()
+            
+            # 计算当前步耗时
+            if loop_start_time[0] is not None:
+                step_time = current_time - loop_start_time[0]
+                step_times.append(step_time)
+            loop_start_time[0] = current_time
+            
+            # 更新进度条
             pbar.update(1)
+            
+            # 如果有 PromptServer 且有 unique_id，发送进度文本
+            if _HAS_SERVER and unique_id is not None and len(step_times) > 0:
+                # 计算平均每步时间
+                avg_step_time = sum(step_times) / len(step_times)
+                # 已完成步数（step_index 是 0-based，callback 在步完成后调用）
+                completed_steps = step_index + 1
+                remaining_steps = num_inference_steps - completed_steps
+                eta_seconds = remaining_steps * avg_step_time
+                
+                # 格式化 ETA
+                if eta_seconds >= 60:
+                    eta_str = f"{int(eta_seconds // 60)}m {int(eta_seconds % 60)}s"
+                else:
+                    eta_str = f"{eta_seconds:.1f}s"
+                
+                # 发送进度文本到 UI
+                progress_text = f"Step {completed_steps}/{num_inference_steps} | {step_times[-1]:.2f}s/step | ETA: {eta_str}"
+                try:
+                    PromptServer.instance.send_progress_text(progress_text, unique_id)
+                except Exception:
+                    pass  # 忽略发送失败
+            
             return callback_kwargs
         
         start_time = time.perf_counter()
+        loop_start_time[0] = start_time  # 初始化循环开始时间
         
         # Hybrid 方案：enable_globally() 已激活，只需 with mesh: 用于 sharding context
         with mesh:
@@ -1241,6 +1318,16 @@ class Wan21TPUSampler:
         print(f"  平均每步时间: {elapsed/num_inference_steps:.2f}s")
         print(f"  Latents shape: {torch_latents.shape}")
         print(f"  Latents dtype: {torch_latents.dtype}")
+        
+        # 发送完成消息
+        if _HAS_SERVER and unique_id is not None:
+            try:
+                PromptServer.instance.send_progress_text(
+                    f"Complete! Total: {elapsed:.2f}s ({elapsed/num_inference_steps:.2f}s/step)",
+                    unique_id
+                )
+            except Exception:
+                pass
         
         return ({"samples": torch_latents, "num_frames": num_frames}, num_frames)
     
