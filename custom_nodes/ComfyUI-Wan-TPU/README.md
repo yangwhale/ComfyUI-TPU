@@ -95,6 +95,17 @@ git clone https://github.com/yangwhale/ComfyUI-TPU.git
 cd ComfyUI-TPU
 ```
 
+### 6. 安装 VideoHelperSuite（可选，用于视频输出）
+
+```bash
+cd custom_nodes
+git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git
+cd ..
+pip install imageio_ffmpeg
+```
+
+> VideoHelperSuite 提供 VHS Video Combine 节点，用于将生成的帧合成为 MP4 视频。
+
 ## 启动 ComfyUI
 
 **重要**: 必须使用 `--cpu` 参数启动 ComfyUI：
