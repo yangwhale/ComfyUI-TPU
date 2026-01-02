@@ -26,71 +26,49 @@ import jax.numpy as jnp
 import numpy as np
 import torch
 from jax.experimental import mesh_utils
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from jax.sharding import Mesh
 
 # ComfyUI progress bar and server
-try:
-    from comfy.utils import ProgressBar
-    from server import PromptServer
-    _HAS_SERVER = True
-except ImportError:
-    # 独立运行时的 fallback
-    class ProgressBar:
-        def __init__(self, total, node_id=None):
-            self.total = total
-            self.current = 0
-            self.node_id = node_id
-        def update(self, n=1):
-            self.current += n
-        def update_absolute(self, value, total=None, preview=None):
-            self.current = value
-    PromptServer = None
-    _HAS_SERVER = False
+from comfy.utils import ProgressBar
+from server import PromptServer
 
-# 延迟导入 utils（支持独立测试）
-try:
-    from .utils import (
-        TRANSFORMER_SHARDINGS,
-        VAE_DECODER_SHARDINGS,
-        move_module_to_xla,
-        shard_weight_dict,
-        setup_jax_cache,
-        setup_pytree_registrations,
-    )
-except ImportError:
-    # 独立运行时使用本地定义
-    TRANSFORMER_SHARDINGS = {}
-    VAE_DECODER_SHARDINGS = {}
+# 从 utils 导入辅助函数
+from .utils import (
+    TRANSFORMER_SHARDINGS,
+    VAE_DECODER_SHARDINGS,
+    move_module_to_xla,
+    shard_weight_dict,
+    setup_jax_cache,
+    setup_pytree_registrations,
+)
+
+
+# ============================================================================
+# 公共辅助函数
+# ============================================================================
+
+def to_cpu_tensor(tensor):
+    """
+    将 XLA tensor 安全转换为 CPU tensor。
     
-    def move_module_to_xla(env, module):
-        with jax.default_device("cpu"):
-            state_dict = module.state_dict()
-            state_dict = env.to_xla(state_dict)
-            module.load_state_dict(state_dict, assign=True)
+    处理三种情况：
+    1. torchax tensor (有 _elem 属性): 通过 JAX 转换
+    2. 普通 torch tensor (有 cpu 方法): 直接调用 cpu()
+    3. 其他: 直接返回
     
-    def shard_weight_dict(weight_dict, sharding_dict, mesh, debug=False):
-        import re
-        result = {}
-        for k, v in weight_dict.items():
-            if isinstance(v, torch.Tensor):
-                with jax.default_device("cpu"):
-                    v = v.to("jax")
-            matched = False
-            for pattern, sharding in sharding_dict.items():
-                if re.fullmatch(pattern, k) is not None:
-                    v.apply_jax_(jax.device_put, NamedSharding(mesh, P(*sharding)))
-                    matched = True
-                    break
-            if not matched:
-                v.apply_jax_(jax.device_put, NamedSharding(mesh, P()))
-            result[k] = v
-        return result
-    
-    def setup_jax_cache():
-        pass
-    
-    def setup_pytree_registrations():
-        pass
+    注意：bfloat16 需要先转为 float32 再转回，因为 numpy 不支持 bfloat16。
+    """
+    if hasattr(tensor, '_elem'):
+        jax_arr = tensor._elem
+        if jax_arr.dtype == jnp.bfloat16:
+            np_arr = np.array(jax_arr.astype(jnp.float32))
+            return torch.from_numpy(np_arr).to(torch.bfloat16)
+        else:
+            return torch.from_numpy(np.array(jax_arr))
+    elif hasattr(tensor, 'cpu'):
+        return tensor.cpu()
+    else:
+        return tensor
 
 
 # ============================================================================
@@ -116,67 +94,22 @@ def get_mesh():
 
 
 # ============================================================================
-# PyTree 注册
+# VAE 专用算子注册
 # ============================================================================
 
-_pytree_registered = False
+_vae_ops_registered = False
 
 
-def _setup_pytree():
-    """注册必要的 PyTree 节点以支持 JAX 转换"""
-    global _pytree_registered
-    if _pytree_registered:
+def _register_operators_on_env_for_vae(env):
+    """
+    在 torchax 环境上注册 VAE Decoder 所需的 conv2d 算子。
+    
+    参考: gpu-tpu-pedia/tpu/Flux.2/generate_diffusers_torchax_staged/stage3_vae_decoder.py
+    """
+    global _vae_ops_registered
+    if _vae_ops_registered:
         return
     
-    from jax.tree_util import register_pytree_node
-    from diffusers.models import modeling_outputs as diffusers_modeling_outputs
-    from diffusers.models.autoencoders import vae as diffusers_vae
-    from transformers import modeling_outputs
-    
-    print("注册 PyTree 节点...")
-    
-    def flatten(obj):
-        return obj.to_tuple(), type(obj)
-    
-    def unflatten(aux, children):
-        return aux(*children)
-    
-    classes = [
-        (modeling_outputs.BaseModelOutputWithPastAndCrossAttentions, "BaseModelOutputWithPastAndCrossAttentions"),
-        (diffusers_vae.DecoderOutput, "DecoderOutput"),
-        (diffusers_modeling_outputs.AutoencoderKLOutput, "AutoencoderKLOutput"),
-    ]
-    
-    for cls, name in classes:
-        try:
-            register_pytree_node(cls, flatten, unflatten)
-            print(f"  - {name} 已注册")
-        except ValueError:
-            print(f"  - {name} 已存在")
-    
-    _pytree_registered = True
-
-
-# ============================================================================
-# 自定义算子注册
-# ============================================================================
-
-def _register_operators_on_env(env, mesh_obj):
-    """
-    在 torchax 环境上注册 TPU 所需的自定义算子。
-    
-    注册的算子:
-      - conv2d: 2D 卷积
-      - cartesian_prod: 笛卡尔积
-      - chunk: 张量分块
-      - layer_norm / native_layer_norm: 层归一化
-      - unflatten: 维度展开
-      - rms_norm: RMS 归一化
-      - dropout / native_dropout: Dropout（推理时直接返回）
-      - group_norm / native_group_norm: 组归一化
-      - scaled_dot_product_attention: Splash Attention（可选）
-    """
-    # 延迟导入 torchax 组件
     from torchax.ops import jaten, ops_registry
     
     def override_op(op, impl):
@@ -194,230 +127,18 @@ def _register_operators_on_env(env, mesh_obj):
         return env.j2t_iso(res)
     
     override_op(torch.nn.functional.conv2d, functools.partial(conv2d_impl, env=env))
+    print("[Torchax] Registered conv2d operator for VAE")
     
-    # ---- cartesian_prod ----
-    def cartesian_prod_impl(tensors, env=env):
-        if len(tensors) == 0:
-            return env.j2t_iso(jnp.empty((0, 0)))
-        if len(tensors) == 1:
-            jt = env.t2j_iso(tensors[0])
-            return env.j2t_iso(jnp.expand_dims(jt, axis=1))
-        jarrays = [env.t2j_iso(t) for t in tensors]
-        grids = jnp.meshgrid(*jarrays, indexing='ij')
-        result = jnp.stack([g.ravel() for g in grids], axis=-1)
-        return env.j2t_iso(result)
-    
-    try:
-        override_op(torch.ops.aten.cartesian_prod.default, functools.partial(cartesian_prod_impl, env=env))
-    except Exception:
-        pass
-    
-    # ---- chunk ----
-    def chunk_impl(input, chunks, dim=0, env=env):
-        jinput = env.t2j_iso(input)
-        if dim < 0:
-            dim = len(jinput.shape) + dim
-        size = jinput.shape[dim]
-        chunk_size = (size + chunks - 1) // chunks
-        splits = []
-        for i in range(chunks):
-            start = i * chunk_size
-            end = min((i + 1) * chunk_size, size)
-            if start >= size:
-                break
-            slices = [slice(None)] * len(jinput.shape)
-            slices[dim] = slice(start, end)
-            splits.append(env.j2t_iso(jinput[tuple(slices)]))
-        return splits
-    
-    try:
-        override_op(torch.ops.aten.chunk.default, functools.partial(chunk_impl, env=env))
-    except Exception:
-        pass
-    
-    # ---- layer_norm ----
-    def layer_norm_impl(input, normalized_shape, weight=None, bias=None, eps=1e-5, env=env):
-        jinput = env.t2j_iso(input)
-        jweight = env.t2j_iso(weight) if weight is not None else None
-        jbias = env.t2j_iso(bias) if bias is not None else None
-        
-        axis = tuple(range(-len(normalized_shape), 0))
-        mean = jnp.mean(jinput, axis=axis, keepdims=True)
-        var = jnp.var(jinput, axis=axis, keepdims=True)
-        result = (jinput - mean) / jnp.sqrt(var + eps)
-        
-        if jweight is not None:
-            result = result * jweight
-        if jbias is not None:
-            result = result + jbias
-        return env.j2t_iso(result)
-    
-    def native_layer_norm_impl(input, normalized_shape, weight, bias, eps, env=env):
-        jinput = env.t2j_iso(input)
-        jweight = env.t2j_iso(weight) if weight is not None else None
-        jbias = env.t2j_iso(bias) if bias is not None else None
-        
-        axis = tuple(range(-len(normalized_shape), 0))
-        mean = jnp.mean(jinput, axis=axis, keepdims=True)
-        var = jnp.var(jinput, axis=axis, keepdims=True)
-        rstd = 1.0 / jnp.sqrt(var + eps)
-        result = (jinput - mean) * rstd
-        
-        if jweight is not None:
-            result = result * jweight
-        if jbias is not None:
-            result = result + jbias
-        return env.j2t_iso(result), env.j2t_iso(mean.squeeze(axis)), env.j2t_iso(rstd.squeeze(axis))
-    
-    try:
-        override_op(torch.ops.aten.layer_norm.default, functools.partial(layer_norm_impl, env=env))
-        override_op(torch.ops.aten.native_layer_norm.default, functools.partial(native_layer_norm_impl, env=env))
-    except Exception:
-        pass
-    
-    # ---- unflatten ----
-    def unflatten_impl(input, dim, sizes, env=env):
-        jinput = env.t2j_iso(input)
-        shape = list(jinput.shape)
-        if dim < 0:
-            dim = len(shape) + dim
-        
-        sizes = list(sizes)
-        if -1 in sizes:
-            neg_idx = sizes.index(-1)
-            known_prod = 1
-            for i, s in enumerate(sizes):
-                if i != neg_idx:
-                    known_prod *= s
-            sizes[neg_idx] = shape[dim] // known_prod
-        
-        new_shape = shape[:dim] + sizes + shape[dim+1:]
-        return env.j2t_iso(jnp.reshape(jinput, new_shape))
-    
-    try:
-        override_op(torch.ops.aten.unflatten.int, functools.partial(unflatten_impl, env=env))
-    except Exception:
-        pass
-    
-    # ---- rms_norm ----
-    def rms_norm_impl(input, normalized_shape, weight=None, eps=1e-6, env=env):
-        jinput = env.t2j_iso(input)
-        jweight = env.t2j_iso(weight) if weight is not None else None
-        
-        axis = tuple(range(-len(normalized_shape), 0))
-        rms = jnp.sqrt(jnp.mean(jinput ** 2, axis=axis, keepdims=True) + eps)
-        result = jinput / rms
-        
-        if jweight is not None:
-            result = result * jweight
-        return env.j2t_iso(result)
-    
-    try:
-        override_op(torch.ops.aten.rms_norm.default, functools.partial(rms_norm_impl, env=env))
-        override_op(torch.rms_norm, functools.partial(rms_norm_impl, env=env))
-    except Exception:
-        pass
-    
-    # ---- dropout ----
-    def dropout_impl(input, p=0.5, training=False, inplace=False, env=env):
-        if not training or p == 0:
-            return input
-        jinput = env.t2j_iso(input)
-        key = jax.random.PRNGKey(42)
-        mask = jax.random.bernoulli(key, 1 - p, shape=jinput.shape)
-        return env.j2t_iso(jinput * mask / (1 - p))
-    
-    def native_dropout_impl(input, p, train, env=env):
-        if not train or p == 0:
-            return input, torch.ones_like(input, dtype=torch.bool)
-        jinput = env.t2j_iso(input)
-        key = jax.random.PRNGKey(42)
-        mask = jax.random.bernoulli(key, 1 - p, shape=jinput.shape)
-        return env.j2t_iso(jinput * mask / (1 - p)), env.j2t_iso(mask.astype(jnp.bool_))
-    
-    try:
-        override_op(torch.ops.aten.dropout.default, functools.partial(dropout_impl, env=env))
-        override_op(torch.ops.aten.native_dropout.default, functools.partial(native_dropout_impl, env=env))
-    except Exception:
-        pass
-    
-    # ---- group_norm ----
-    def group_norm_impl(input, num_groups, weight=None, bias=None, eps=1e-5, env=env):
-        jinput = env.t2j_iso(input)
-        jweight = env.t2j_iso(weight) if weight is not None else None
-        jbias = env.t2j_iso(bias) if bias is not None else None
-        
-        shape = jinput.shape
-        N, C = shape[0], shape[1]
-        spatial_dims = shape[2:]
-        group_size = C // num_groups
-        
-        x = jnp.reshape(jinput, (N, num_groups, group_size) + spatial_dims)
-        reduce_axes = tuple(range(2, len(x.shape)))
-        mean = jnp.mean(x, axis=reduce_axes, keepdims=True)
-        var = jnp.var(x, axis=reduce_axes, keepdims=True)
-        x = (x - mean) / jnp.sqrt(var + eps)
-        result = jnp.reshape(x, shape)
-        
-        if jweight is not None:
-            weight_shape = (1, C) + (1,) * len(spatial_dims)
-            result = result * jnp.reshape(jweight, weight_shape)
-        if jbias is not None:
-            bias_shape = (1, C) + (1,) * len(spatial_dims)
-            result = result + jnp.reshape(jbias, bias_shape)
-        return env.j2t_iso(result)
-    
-    def native_group_norm_impl(input, weight, bias, N, C, HxW, group, eps, env=env):
-        jinput = env.t2j_iso(input)
-        jweight = env.t2j_iso(weight) if weight is not None else None
-        jbias = env.t2j_iso(bias) if bias is not None else None
-        
-        shape = jinput.shape
-        spatial_dims = shape[2:]
-        group_size = C // group
-        
-        x = jnp.reshape(jinput, (N, group, group_size) + spatial_dims)
-        reduce_axes = tuple(range(2, len(x.shape)))
-        mean = jnp.mean(x, axis=reduce_axes, keepdims=True)
-        var = jnp.var(x, axis=reduce_axes, keepdims=True)
-        rstd = 1.0 / jnp.sqrt(var + eps)
-        x = (x - mean) * rstd
-        result = jnp.reshape(x, shape)
-        
-        if jweight is not None:
-            weight_shape = (1, C) + (1,) * len(spatial_dims)
-            result = result * jnp.reshape(jweight, weight_shape)
-        if jbias is not None:
-            bias_shape = (1, C) + (1,) * len(spatial_dims)
-            result = result + jnp.reshape(jbias, bias_shape)
-        
-        mean_out = jnp.mean(x, axis=reduce_axes).reshape(N, group)
-        rstd_out = jnp.mean(rstd, axis=reduce_axes).reshape(N, group)
-        return env.j2t_iso(result), env.j2t_iso(mean_out), env.j2t_iso(rstd_out)
-    
-    try:
-        override_op(torch.ops.aten.group_norm.default, functools.partial(group_norm_impl, env=env))
-        override_op(torch.ops.aten.native_group_norm.default, functools.partial(native_group_norm_impl, env=env))
-    except Exception:
-        pass
-    
-    # ---- Splash Attention (可选) ----
-    try:
-        from .splash_attention import sdpa_reference, tpu_splash_attention
-        
-        def sdpa_tpu(query, key, value, attn_mask=None, dropout_p=0.0,
-                     is_causal=False, scale=None, enable_gqa=False, env=env, mesh=mesh_obj):
-            if key.shape[2] > 20000:
-                jquery, jkey, jvalue = env.t2j_iso((query, key, value))
-                jkey = jkey - jnp.mean(jkey, axis=2, keepdims=True)  # K-smooth
-                res = tpu_splash_attention(jquery, jkey, jvalue, mesh, scale=scale)
-                return env.j2t_iso(res)
-            return sdpa_reference(query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa)
-        
-        override_op(torch.nn.functional.scaled_dot_product_attention,
-                    functools.partial(sdpa_tpu, env=env, mesh=mesh_obj))
-    except ImportError:
-        pass
+    _vae_ops_registered = True
+
+
+# ============================================================================
+# 性能配置开关
+# ============================================================================
+
+# 设置为 True 启用完整算子注册 + inference_mode(True)
+# 设置为 False 使用 VAE conv2d only + inference_mode(False) fallback
+USE_FULL_OPS_REGISTRATION = False
 
 
 # ============================================================================
@@ -460,9 +181,11 @@ def ensure_torchax_enabled(mesh_obj=None):
         _torchax_env = torchax.default_env()
     
     # 注册算子（只需一次）
-    if not _ops_registered and mesh_obj is not None:
-        print("[Torchax] Registering operators...")
-        _register_operators_on_env(_torchax_env, mesh_obj)
+    # 根据 USE_FULL_OPS_REGISTRATION 决定是否注册所有算子
+    if USE_FULL_OPS_REGISTRATION and not _ops_registered and mesh_obj is not None:
+        from .utils import register_operators_on_env
+        print("[Torchax] Registering ALL operators (full mode)...")
+        register_operators_on_env(_torchax_env, mesh_obj)
         _ops_registered = True
     
     return _torchax_env
@@ -623,8 +346,8 @@ class Flux2TPUSampler:
         print(f"  Height: {height}, Width: {width}")
         print(f"  Steps: {num_inference_steps}, Guidance: {guidance_scale}, Seed: {seed}")
         
-        # 注册 PyTree
-        _setup_pytree()
+        # 注册 PyTree（使用 utils 中的函数）
+        setup_pytree_registrations()
         
         # 加载 Pipeline（如果需要）
         real_mesh = get_mesh()
@@ -653,8 +376,8 @@ class Flux2TPUSampler:
             # 更新进度条
             pbar.update(1)
             
-            # 如果有 PromptServer 且有 unique_id，发送进度文本
-            if _HAS_SERVER and unique_id is not None and len(step_times) > 0:
+            # 如果有 unique_id，发送进度文本
+            if unique_id is not None and len(step_times) > 0:
                 # 计算平均每步时间
                 avg_step_time = sum(step_times) / len(step_times)
                 # 已完成步数（step_index 是 0-based，callback 在步完成后调用）
@@ -685,24 +408,29 @@ class Flux2TPUSampler:
             start_time = time.perf_counter()
             loop_start_time[0] = start_time  # 初始化循环开始时间
             
-            result = pipe(
-                prompt=None,
-                prompt_embeds=prompt_embeds_xla,
-                height=height,
-                width=width,
-                num_inference_steps=num_inference_steps,
-                guidance_scale=guidance_scale,
-                generator=generator,
-                output_type='latent',
-                callback_on_step_end=progress_callback,
-            )
+            # 根据配置决定 inference_mode
+            # - USE_FULL_OPS_REGISTRATION=True: 所有算子已注册，可以使用 inference_mode(True)
+            # - USE_FULL_OPS_REGISTRATION=False: 需要 fallback，必须用 inference_mode(False)
+            use_inference_mode = USE_FULL_OPS_REGISTRATION
+            with torch.inference_mode(use_inference_mode), torch.no_grad():
+                result = pipe(
+                    prompt=None,
+                    prompt_embeds=prompt_embeds_xla,
+                    height=height,
+                    width=width,
+                    num_inference_steps=num_inference_steps,
+                    guidance_scale=guidance_scale,
+                    generator=generator,
+                    output_type='latent',
+                    callback_on_step_end=progress_callback,
+                )
             jax.effects_barrier()
             
             elapsed = time.perf_counter() - start_time
             print(f"  Done: {elapsed:.2f}s ({elapsed/num_inference_steps:.2f}s/step)")
             
             # 发送完成消息
-            if _HAS_SERVER and unique_id is not None:
+            if unique_id is not None:
                 try:
                     PromptServer.instance.send_progress_text(
                         f"Complete! Total: {elapsed:.2f}s ({elapsed/num_inference_steps:.2f}s/step)",
@@ -712,24 +440,9 @@ class Flux2TPUSampler:
                     pass
             
             # 转换 latents 为 CPU tensor（返回给 ComfyUI）
-            torch_latents = self._to_cpu_tensor(result.images)
+            torch_latents = to_cpu_tensor(result.images)
         
         return ({"samples": torch_latents},)
-    
-    @staticmethod
-    def _to_cpu_tensor(tensor):
-        """将 XLA tensor 安全转换为 CPU tensor"""
-        if hasattr(tensor, '_elem'):
-            jax_arr = tensor._elem
-            if jax_arr.dtype == jnp.bfloat16:
-                np_arr = np.array(jax_arr.astype(jnp.float32))
-                return torch.from_numpy(np_arr).to(torch.bfloat16)
-            else:
-                return torch.from_numpy(np.array(jax_arr))
-        elif hasattr(tensor, 'cpu'):
-            return tensor.cpu()
-        else:
-            return tensor
     
     def _get_or_create_pipeline(self, model_id, mesh):
         """
@@ -854,17 +567,20 @@ class Flux2TPUVAEDecoder:
         
         # Hybrid 方案：enable_globally() 已激活，只需 with mesh: 用于 sharding context
         with real_mesh:
-            # 处理 latents
+            # 处理 latents: unpack(序列→空间) -> denormalize(反BN) -> unpatchify(2x2还原)
             processed_latents = self._process_latents(latent_tensor, height, width, vae)
+            # 将 CPU tensor 转换为 torchax XLA tensor，以便在 TPU 上运行 VAE 解码
             processed_latents = env.to_xla(processed_latents.to(torch.bfloat16))
             
             print("  Decoding...")
-            with torch.no_grad():
+            # 根据配置决定 inference_mode
+            use_inference_mode = USE_FULL_OPS_REGISTRATION
+            with torch.inference_mode(use_inference_mode), torch.no_grad():
                 image = vae.decode(processed_latents, return_dict=False)[0]
             jax.effects_barrier()
             
             # 转换回 CPU（返回给 ComfyUI）
-            image_cpu = self._to_cpu_tensor(image)
+            image_cpu = to_cpu_tensor(image)
         
         print(f"  VAE decode: {time.perf_counter() - start_time:.2f}s")
         
@@ -872,21 +588,6 @@ class Flux2TPUVAEDecoder:
         image_output = self._postprocess_image(image_cpu)
         
         return (image_output,)
-    
-    @staticmethod
-    def _to_cpu_tensor(tensor):
-        """将 XLA tensor 安全转换为 CPU tensor"""
-        if hasattr(tensor, '_elem'):
-            jax_arr = tensor._elem
-            if jax_arr.dtype == jnp.bfloat16:
-                np_arr = np.array(jax_arr.astype(jnp.float32))
-                return torch.from_numpy(np_arr).to(torch.bfloat16)
-            else:
-                return torch.from_numpy(np.array(jax_arr))
-        elif hasattr(tensor, 'cpu'):
-            return tensor.cpu()
-        else:
-            return tensor
     
     def _get_or_create_vae(self, model_id, mesh):
         """
@@ -918,6 +619,9 @@ class Flux2TPUVAEDecoder:
         
         # ===== 步骤 2：启用 torchax 并注册算子 =====
         env = ensure_torchax_enabled(mesh)
+        
+        # 注册 VAE 所需的 conv2d 算子
+        _register_operators_on_env_for_vae(env)
         
         # ===== 步骤 3：在 with mesh: 块内设置 VAE Decoder =====
         with mesh:
