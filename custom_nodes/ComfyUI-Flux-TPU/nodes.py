@@ -5,6 +5,11 @@ ComfyUI Flux.2 TPU Nodes
 使用 diffusers 的 torchax 优化模型在 TPU 上运行 Flux.2 推理。
 基于 gpu-tpu-pedia/tpu/Flux.2/generate_diffusers_torchax_staged 实现。
 
+核心设计（Hybrid 方案）：
+  - 使用 `enable_globally()` 保持 Mode 栈激活（解决 XLA tensor 逃逸问题）
+  - 模型缓存后权重保持 XLA 状态
+  - 节点返回值必须转为 CPU tensor（确保与 ComfyUI 兼容）
+
 Nodes:
   - Flux2TextEncoder: CPU 上运行 Mistral3 编码 prompt
   - Flux2TPUSampler: TPU 上运行 Transformer 生成 latents
@@ -20,17 +25,117 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import torch
-import torchax
-from jax.sharding import NamedSharding
-from torchax.ops import jaten, ops_registry
+from jax.experimental import mesh_utils
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from . import mesh
-from .utils import (
-    TRANSFORMER_SHARDINGS,
-    VAE_DECODER_SHARDINGS,
-    move_module_to_xla,
-    shard_weight_dict,
-)
+# 延迟导入 utils（支持独立测试）
+try:
+    from .utils import (
+        TRANSFORMER_SHARDINGS,
+        VAE_DECODER_SHARDINGS,
+        move_module_to_xla,
+        shard_weight_dict,
+        setup_jax_cache,
+        setup_pytree_registrations,
+    )
+except ImportError:
+    # 独立运行时使用本地定义
+    TRANSFORMER_SHARDINGS = {}
+    VAE_DECODER_SHARDINGS = {}
+    
+    def move_module_to_xla(env, module):
+        with jax.default_device("cpu"):
+            state_dict = module.state_dict()
+            state_dict = env.to_xla(state_dict)
+            module.load_state_dict(state_dict, assign=True)
+    
+    def shard_weight_dict(weight_dict, sharding_dict, mesh, debug=False):
+        import re
+        result = {}
+        for k, v in weight_dict.items():
+            if isinstance(v, torch.Tensor):
+                with jax.default_device("cpu"):
+                    v = v.to("jax")
+            matched = False
+            for pattern, sharding in sharding_dict.items():
+                if re.fullmatch(pattern, k) is not None:
+                    v.apply_jax_(jax.device_put, NamedSharding(mesh, P(*sharding)))
+                    matched = True
+                    break
+            if not matched:
+                v.apply_jax_(jax.device_put, NamedSharding(mesh, P()))
+            result[k] = v
+        return result
+    
+    def setup_jax_cache():
+        pass
+    
+    def setup_pytree_registrations():
+        pass
+
+
+# ============================================================================
+# 全局 mesh（延迟创建）
+# ============================================================================
+
+_mesh = None
+
+
+def get_mesh():
+    """获取全局 mesh，如果不存在则创建"""
+    global _mesh
+    if _mesh is None:
+        print("[Flux2] Creating 1D Mesh for TPU...")
+        devices = jax.devices('tpu')
+        tp_dim = len(devices)
+        mesh_devices = mesh_utils.create_device_mesh(
+            (tp_dim,), allow_split_physical_axes=True
+        )
+        _mesh = Mesh(mesh_devices, ("tp",))
+        print(f"[Flux2] Created Mesh: tp={tp_dim}")
+    return _mesh
+
+
+# ============================================================================
+# PyTree 注册
+# ============================================================================
+
+_pytree_registered = False
+
+
+def _setup_pytree():
+    """注册必要的 PyTree 节点以支持 JAX 转换"""
+    global _pytree_registered
+    if _pytree_registered:
+        return
+    
+    from jax.tree_util import register_pytree_node
+    from diffusers.models import modeling_outputs as diffusers_modeling_outputs
+    from diffusers.models.autoencoders import vae as diffusers_vae
+    from transformers import modeling_outputs
+    
+    print("注册 PyTree 节点...")
+    
+    def flatten(obj):
+        return obj.to_tuple(), type(obj)
+    
+    def unflatten(aux, children):
+        return aux(*children)
+    
+    classes = [
+        (modeling_outputs.BaseModelOutputWithPastAndCrossAttentions, "BaseModelOutputWithPastAndCrossAttentions"),
+        (diffusers_vae.DecoderOutput, "DecoderOutput"),
+        (diffusers_modeling_outputs.AutoencoderKLOutput, "AutoencoderKLOutput"),
+    ]
+    
+    for cls, name in classes:
+        try:
+            register_pytree_node(cls, flatten, unflatten)
+            print(f"  - {name} 已注册")
+        except ValueError:
+            print(f"  - {name} 已存在")
+    
+    _pytree_registered = True
 
 
 # ============================================================================
@@ -52,6 +157,8 @@ def _register_operators_on_env(env, mesh_obj):
       - group_norm / native_group_norm: 组归一化
       - scaled_dot_product_attention: Splash Attention（可选）
     """
+    # 延迟导入 torchax 组件
+    from torchax.ops import jaten, ops_registry
     
     def override_op(op, impl):
         """注册或覆盖一个算子"""
@@ -295,83 +402,50 @@ def _register_operators_on_env(env, mesh_obj):
 
 
 # ============================================================================
-# Torchax 环境管理（单例模式）
+# Torchax 环境管理（Hybrid 方案：enable_globally）
 # ============================================================================
 
-class TorchaxEnvManager:
-    """
-    Torchax 环境的单例管理器。
-    
-    - 首次调用 get_env() 时执行 enable_globally() 并注册算子
-    - 后续调用直接返回已有的 env
-    - pause()/resume() 用于模型加载时临时禁用环境
-    """
-    _env = None
-    _initialized = False
-    
-    @classmethod
-    def get_env(cls, mesh_obj=None):
-        """获取或创建全局 torchax 环境"""
-        if not cls._initialized:
-            print("[TorchaxEnvManager] Initializing global torchax environment...")
-            torchax.enable_globally()
-            cls._env = torchax.default_env()
-            _register_operators_on_env(cls._env, mesh_obj or mesh)
-            cls._initialized = True
-            print("[TorchaxEnvManager] Environment initialized.")
-        return cls._env
-    
-    @classmethod
-    def pause(cls):
-        """临时暂停 torchax 环境（用于模型加载）"""
-        if cls._initialized:
-            try:
-                torchax.disable_globally()
-            except Exception:
-                pass
-    
-    @classmethod
-    def resume(cls):
-        """恢复 torchax 环境"""
-        if cls._initialized:
-            try:
-                torchax.enable_globally()
-            except Exception:
-                pass
-    
-    @classmethod
-    def reset(cls):
-        """完全重置环境"""
-        if cls._initialized:
-            try:
-                torchax.disable_globally()
-            except Exception:
-                pass
-            cls._env = None
-            cls._initialized = False
+# 全局状态
+_torchax_env = None
+_ops_registered = False
+_globally_enabled = False
 
 
-class TorchaxContext:
+def ensure_torchax_enabled(mesh_obj=None):
     """
-    Torchax 环境上下文管理器。
+    确保 torchax 全局启用，返回 env。
     
-    用法:
-        with TorchaxContext() as ctx:
-            # ctx.env 是 torchax 环境
-            xla_tensor = ctx.env.to_xla(tensor)
+    Hybrid 方案：
+    - 首次调用时 enable_globally()，之后保持启用
+    - 这样缓存的 XLA 模型权重可以在后续调用中正常工作
+    - 节点返回值必须转为 CPU tensor（由各节点负责）
     """
-    def __init__(self, mesh_obj=None, disable_on_exit=False):
-        self.mesh_obj = mesh_obj or mesh
-        self.disable_on_exit = disable_on_exit
-        self.env = None
+    global _torchax_env, _ops_registered, _globally_enabled
+    import torchax
     
-    def __enter__(self):
-        self.env = TorchaxEnvManager.get_env(self.mesh_obj)
-        return self
+    # 首次调用时全局启用
+    if not _globally_enabled:
+        print("[Torchax] Enabling globally (Hybrid mode)...")
+        torchax.enable_globally()
+        _globally_enabled = True
     
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.disable_on_exit:
-            TorchaxEnvManager.reset()
+    # 获取 env
+    if _torchax_env is None:
+        _torchax_env = torchax.default_env()
+    
+    # 注册算子（只需一次）
+    if not _ops_registered and mesh_obj is not None:
+        print("[Torchax] Registering operators...")
+        _register_operators_on_env(_torchax_env, mesh_obj)
+        _ops_registered = True
+    
+    return _torchax_env
+
+
+# 保留旧函数名以兼容
+def get_torchax_env(mesh_obj=None):
+    """兼容旧代码，内部调用 ensure_torchax_enabled"""
+    return ensure_torchax_enabled(mesh_obj)
 
 
 # ============================================================================
@@ -470,12 +544,17 @@ class Flux2TextEncoder:
 
 
 # ============================================================================
-# Flux.2 TPU Sampler
+# Flux.2 TPU Sampler - Hybrid 方案
 # ============================================================================
 
 class Flux2TPUSampler:
     """
     Flux.2 TPU Sampler - 在 TPU 上运行 Transformer 去噪。
+    
+    Hybrid 方案：
+    - 使用 ensure_torchax_enabled() 保持 Mode 栈激活
+    - 模型缓存后权重保持 XLA 状态
+    - 返回值转为 CPU tensor（确保与 ComfyUI 兼容）
     
     输入: prompt_embeds (来自 TextEncoder)
     输出: latents (用于 VAE Decoder)
@@ -483,6 +562,7 @@ class Flux2TPUSampler:
     
     _cached_pipeline = None
     _cached_model_id = None
+    _env = None  # 缓存 env 对象
     
     @classmethod
     def INPUT_TYPES(cls):
@@ -506,59 +586,90 @@ class Flux2TPUSampler:
     
     def sample(self, prompt_embeds, height, width, num_inference_steps,
                guidance_scale, seed, model_id="black-forest-labs/FLUX.2-dev"):
-        
+        """
+        运行 Transformer 推理生成 latents（Hybrid 方案）
+        """
         print(f"\n[Flux2TPUSampler] Starting TPU inference...")
         print(f"  Height: {height}, Width: {width}")
         print(f"  Steps: {num_inference_steps}, Guidance: {guidance_scale}, Seed: {seed}")
         
-        pipe = self._get_or_create_pipeline(model_id)
+        # 注册 PyTree
+        _setup_pytree()
         
-        with TorchaxContext() as ctx:
+        # 加载 Pipeline（如果需要）
+        real_mesh = get_mesh()
+        pipe, env = self._get_or_create_pipeline(model_id, real_mesh)
+        
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+        
+        # Hybrid 方案：enable_globally() 已激活，只需 with mesh: 用于 sharding context
+        with real_mesh:
             prompt_embeds_xla = prompt_embeds.to('jax')
             
-            generator = torch.Generator()
-            generator.manual_seed(seed)
+            print(f"  Running denoising loop...")
+            start_time = time.perf_counter()
             
-            with mesh:
-                print(f"  Running denoising loop...")
-                start_time = time.perf_counter()
-                
-                result = pipe(
-                    prompt=None,
-                    prompt_embeds=prompt_embeds_xla,
-                    height=height,
-                    width=width,
-                    num_inference_steps=num_inference_steps,
-                    guidance_scale=guidance_scale,
-                    generator=generator,
-                    output_type='latent',
-                )
-                jax.effects_barrier()
-                
-                elapsed = time.perf_counter() - start_time
-                print(f"  Done: {elapsed:.2f}s ({elapsed/num_inference_steps:.2f}s/step)")
+            result = pipe(
+                prompt=None,
+                prompt_embeds=prompt_embeds_xla,
+                height=height,
+                width=width,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                generator=generator,
+                output_type='latent',
+            )
+            jax.effects_barrier()
             
-            latents = result.images
-            torch_latents = self._convert_latents_to_cpu(latents)
+            elapsed = time.perf_counter() - start_time
+            print(f"  Done: {elapsed:.2f}s ({elapsed/num_inference_steps:.2f}s/step)")
+            
+            # 转换 latents 为 CPU tensor（返回给 ComfyUI）
+            torch_latents = self._to_cpu_tensor(result.images)
         
         return ({"samples": torch_latents},)
     
-    def _convert_latents_to_cpu(self, latents):
-        """将 XLA latents 转换回 CPU tensor"""
-        if hasattr(latents, '_elem'):
-            jax_latents = latents._elem
-            if jax_latents.dtype == jnp.bfloat16:
-                return torch.from_numpy(np.array(jax_latents.astype(jnp.float32))).to(torch.bfloat16)
-            return torch.from_numpy(np.array(jax_latents))
-        return latents.cpu()
+    @staticmethod
+    def _to_cpu_tensor(tensor):
+        """将 XLA tensor 安全转换为 CPU tensor"""
+        if hasattr(tensor, '_elem'):
+            jax_arr = tensor._elem
+            if jax_arr.dtype == jnp.bfloat16:
+                np_arr = np.array(jax_arr.astype(jnp.float32))
+                return torch.from_numpy(np_arr).to(torch.bfloat16)
+            else:
+                return torch.from_numpy(np.array(jax_arr))
+        elif hasattr(tensor, 'cpu'):
+            return tensor.cpu()
+        else:
+            return tensor
     
-    def _get_or_create_pipeline(self, model_id):
-        if (Flux2TPUSampler._cached_pipeline is not None and 
+    def _get_or_create_pipeline(self, model_id, mesh):
+        """
+        加载和配置 Pipeline（Hybrid 方案）
+        
+        流程：
+        1. 临时禁用 torchax 加载模型
+        2. 启用 torchax 并注册算子
+        3. 在 with mesh: 块内配置 Pipeline
+        """
+        import torchax
+        
+        if (Flux2TPUSampler._cached_pipeline is not None and
             Flux2TPUSampler._cached_model_id == model_id):
             print("  Using cached pipeline")
-            return Flux2TPUSampler._cached_pipeline
+            return Flux2TPUSampler._cached_pipeline, Flux2TPUSampler._env
         
         print(f"  Loading Flux.2 Pipeline from {model_id}...")
+        
+        # ===== 步骤 1：禁用 torchax 加载模型（避免拦截 transformers 加载逻辑）=====
+        global _globally_enabled
+        if _globally_enabled:
+            torchax.disable_globally()
+            _globally_enabled = False
+        
+        torch.set_default_dtype(torch.bfloat16)
         
         from diffusers.models.autoencoders.autoencoder_kl_flux2_torchax import AutoencoderKLFlux2
         from diffusers.models.transformers.transformer_flux2_torchax import Flux2Transformer2DModel
@@ -573,10 +684,15 @@ class Flux2TPUSampler:
             model_id, torch_dtype=torch.bfloat16, text_encoder=None,
             vae=vae, transformer=transformer, scheduler=scheduler,
         )
+        print("  ✓ 模型加载完成")
         
-        with TorchaxContext() as ctx:
+        # ===== 步骤 2：启用 torchax 并注册算子 =====
+        env = ensure_torchax_enabled(mesh)
+        
+        # ===== 步骤 3：在 with mesh: 块内配置 Pipeline =====
+        with mesh:
             print("  - Converting Transformer to XLA...")
-            move_module_to_xla(ctx.env, pipe.transformer)
+            move_module_to_xla(env, pipe.transformer)
             
             print("  - Compiling Transformer...")
             pipe.transformer = torchax.compile(pipe.transformer, torchax.CompileOptions(
@@ -587,6 +703,8 @@ class Flux2TPUSampler:
             pipe.transformer.buffers = shard_weight_dict(pipe.transformer.buffers, TRANSFORMER_SHARDINGS, mesh)
             torchax.interop.call_jax(jax.block_until_ready, pipe.transformer.params)
         
+        print("  ✓ Transformer 配置完成")
+        
         # 释放不需要的 VAE（Sampler 只需要 Transformer）
         if hasattr(pipe, 'vae') and pipe.vae is not None:
             del pipe.vae
@@ -595,17 +713,23 @@ class Flux2TPUSampler:
         gc.collect()
         Flux2TPUSampler._cached_pipeline = pipe
         Flux2TPUSampler._cached_model_id = model_id
+        Flux2TPUSampler._env = env
         print("  Pipeline ready!")
-        return pipe
+        return pipe, env
 
 
 # ============================================================================
-# Flux.2 TPU VAE Decoder
+# Flux.2 TPU VAE Decoder - Hybrid 方案
 # ============================================================================
 
 class Flux2TPUVAEDecoder:
     """
     Flux.2 VAE Decoder - 在 TPU 上解码 latents 为图像。
+    
+    Hybrid 方案：
+    - 使用 ensure_torchax_enabled() 保持 Mode 栈激活
+    - 模型缓存后权重保持 XLA 状态
+    - 返回值转为 CPU tensor（确保与 ComfyUI 兼容）
     
     输入: latents (来自 Sampler)
     输出: image tensor (ComfyUI IMAGE 格式)
@@ -613,6 +737,7 @@ class Flux2TPUVAEDecoder:
     
     _cached_vae = None
     _cached_model_id = None
+    _env = None  # 缓存 env 对象
     
     @classmethod
     def INPUT_TYPES(cls):
@@ -635,58 +760,100 @@ class Flux2TPUVAEDecoder:
         print(f"\n[Flux2TPUVAEDecoder] Starting VAE decode...")
         
         latent_tensor = latents["samples"] if isinstance(latents, dict) else latents
-        vae = self._get_or_create_vae(model_id)
         
-        with TorchaxContext() as ctx:
+        real_mesh = get_mesh()
+        vae, env = self._get_or_create_vae(model_id, real_mesh)
+        
+        start_time = time.perf_counter()
+        
+        # Hybrid 方案：enable_globally() 已激活，只需 with mesh: 用于 sharding context
+        with real_mesh:
+            # 处理 latents
             processed_latents = self._process_latents(latent_tensor, height, width, vae)
-            processed_latents = ctx.env.to_xla(processed_latents.to(torch.bfloat16))
+            processed_latents = env.to_xla(processed_latents.to(torch.bfloat16))
             
-            with mesh:
-                print("  Decoding...")
-                start_time = time.perf_counter()
-                with torch.no_grad():
-                    image = vae.decode(processed_latents, return_dict=False)[0]
-                jax.effects_barrier()
-                print(f"  VAE decode: {time.perf_counter() - start_time:.2f}s")
+            print("  Decoding...")
+            with torch.no_grad():
+                image = vae.decode(processed_latents, return_dict=False)[0]
+            jax.effects_barrier()
             
-            image = self._postprocess_image(image)
+            # 转换回 CPU（返回给 ComfyUI）
+            image_cpu = self._to_cpu_tensor(image)
         
-        return (image,)
+        print(f"  VAE decode: {time.perf_counter() - start_time:.2f}s")
+        
+        # 后处理（在 CPU 上）
+        image_output = self._postprocess_image(image_cpu)
+        
+        return (image_output,)
     
-    def _get_or_create_vae(self, model_id):
-        if (Flux2TPUVAEDecoder._cached_vae is not None and 
+    @staticmethod
+    def _to_cpu_tensor(tensor):
+        """将 XLA tensor 安全转换为 CPU tensor"""
+        if hasattr(tensor, '_elem'):
+            jax_arr = tensor._elem
+            if jax_arr.dtype == jnp.bfloat16:
+                np_arr = np.array(jax_arr.astype(jnp.float32))
+                return torch.from_numpy(np_arr).to(torch.bfloat16)
+            else:
+                return torch.from_numpy(np.array(jax_arr))
+        elif hasattr(tensor, 'cpu'):
+            return tensor.cpu()
+        else:
+            return tensor
+    
+    def _get_or_create_vae(self, model_id, mesh):
+        """
+        加载和配置 VAE（Hybrid 方案）
+        
+        流程：
+        1. 临时禁用 torchax 加载模型
+        2. 启用 torchax 并注册算子
+        3. 在 with mesh: 块内：move_to_xla, compile, shard
+        """
+        import torchax
+        
+        if (Flux2TPUVAEDecoder._cached_vae is not None and
             Flux2TPUVAEDecoder._cached_model_id == model_id):
             print("  Using cached VAE")
-            return Flux2TPUVAEDecoder._cached_vae
+            return Flux2TPUVAEDecoder._cached_vae, Flux2TPUVAEDecoder._env
         
         print(f"  Loading VAE from {model_id}...")
+        
+        # ===== 步骤 1：禁用 torchax 加载模型 =====
+        global _globally_enabled
+        if _globally_enabled:
+            torchax.disable_globally()
+            _globally_enabled = False
+        
         from diffusers.models.autoencoders.autoencoder_kl_flux2_torchax import AutoencoderKLFlux2
+        vae = AutoencoderKLFlux2.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.bfloat16)
+        print("  ✓ VAE 加载完成")
         
-        # 重要：模型加载必须在 torchax 环境外进行
-        was_initialized = TorchaxEnvManager._initialized
-        if was_initialized:
-            TorchaxEnvManager.pause()
+        # ===== 步骤 2：启用 torchax 并注册算子 =====
+        env = ensure_torchax_enabled(mesh)
         
-        try:
-            vae = AutoencoderKLFlux2.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.bfloat16)
-        finally:
-            if was_initialized:
-                TorchaxEnvManager.resume()
-        
-        with TorchaxContext() as ctx:
+        # ===== 步骤 3：在 with mesh: 块内设置 VAE Decoder =====
+        with mesh:
             print("  - Converting VAE to XLA...")
-            move_module_to_xla(ctx.env, vae)
+            move_module_to_xla(env, vae)
+            
             print("  - Compiling VAE Decoder...")
             vae.decoder = torchax.compile(vae.decoder)
-            print(f"  - Replicating weights to {len(mesh.devices)} TPU cores...")
+            
+            num_devices = mesh.devices.size
+            print(f"  - Replicating weights to {num_devices} TPU cores...")
             vae.decoder.params = shard_weight_dict(vae.decoder.params, VAE_DECODER_SHARDINGS, mesh)
             vae.decoder.buffers = shard_weight_dict(vae.decoder.buffers, VAE_DECODER_SHARDINGS, mesh)
+        
+        print("  ✓ VAE Decoder 配置完成")
         
         gc.collect()
         Flux2TPUVAEDecoder._cached_vae = vae
         Flux2TPUVAEDecoder._cached_model_id = model_id
+        Flux2TPUVAEDecoder._env = env
         print("  VAE ready!")
-        return vae
+        return vae, env
     
     def _prepare_latent_ids(self, height, width, device=None):
         """生成 latent 位置 ID"""
@@ -738,18 +905,10 @@ class Flux2TPUVAEDecoder:
         return latents
     
     def _postprocess_image(self, image):
-        """后处理图像：XLA -> CPU -> ComfyUI 格式"""
-        if hasattr(image, '_elem'):
-            jax_image = image._elem
-            if jax_image.dtype == jnp.bfloat16:
-                np_image = np.array(jax_image.astype(jnp.float32))
-            else:
-                np_image = np.array(jax_image)
-            image = torch.from_numpy(np_image)
-        else:
-            image = image.cpu()
-        
+        """后处理图像：CPU tensor -> ComfyUI 格式"""
         # 转换为 ComfyUI 格式: (B, H, W, C), 范围 [0, 1]
+        if image.dtype == torch.bfloat16:
+            image = image.float()
         image = image.permute(0, 2, 3, 1)
         image = (image / 2 + 0.5).clamp(0, 1)
         return image
