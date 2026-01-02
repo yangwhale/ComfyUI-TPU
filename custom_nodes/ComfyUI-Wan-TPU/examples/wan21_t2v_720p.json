@@ -1,12 +1,18 @@
 {
-  "last_node_id": 4,
-  "last_link_id": 4,
+  "last_node_id": 5,
+  "last_link_id": 5,
   "nodes": [
     {
       "id": 1,
       "type": "Wan21TextEncoder",
-      "pos": [100, 200],
-      "size": [400, 200],
+      "pos": [
+        100,
+        200
+      ],
+      "size": [
+        400,
+        200
+      ],
       "flags": {},
       "order": 0,
       "mode": 0,
@@ -15,14 +21,18 @@
         {
           "name": "prompt_embeds",
           "type": "TENSOR",
-          "links": [1],
-          "slot_index": 0
+          "slot_index": 0,
+          "links": [
+            1
+          ]
         },
         {
           "name": "negative_prompt_embeds",
           "type": "TENSOR",
-          "links": [2],
-          "slot_index": 1
+          "slot_index": 1,
+          "links": [
+            2
+          ]
         }
       ],
       "properties": {
@@ -37,8 +47,14 @@
     {
       "id": 2,
       "type": "Wan21TPUSampler",
-      "pos": [550, 200],
-      "size": [350, 380],
+      "pos": [
+        550,
+        200
+      ],
+      "size": [
+        350,
+        380
+      ],
       "flags": {},
       "order": 1,
       "mode": 0,
@@ -58,14 +74,16 @@
         {
           "name": "latents",
           "type": "LATENT",
-          "links": [3],
-          "slot_index": 0
+          "slot_index": 0,
+          "links": [
+            3
+          ]
         },
         {
           "name": "num_frames",
           "type": "INT",
-          "links": null,
-          "slot_index": 1
+          "slot_index": 1,
+          "links": null
         }
       ],
       "properties": {
@@ -76,18 +94,24 @@
         1280,
         81,
         50,
-        5.0,
-        2025,
+        5,
+        42,
         "fixed",
         "Wan-AI/Wan2.1-T2V-14B-Diffusers",
-        5.0
+        5
       ]
     },
     {
       "id": 3,
       "type": "Wan21TPUVAEDecoder",
-      "pos": [950, 200],
-      "size": [300, 150],
+      "pos": [
+        950,
+        200
+      ],
+      "size": [
+        300,
+        150
+      ],
       "flags": {},
       "order": 2,
       "mode": 0,
@@ -102,14 +126,16 @@
         {
           "name": "frames",
           "type": "IMAGE",
-          "links": [4],
-          "slot_index": 0
+          "slot_index": 0,
+          "links": [
+            5
+          ]
         },
         {
           "name": "fps",
           "type": "INT",
-          "links": null,
-          "slot_index": 1
+          "slot_index": 1,
+          "links": null
         }
       ],
       "properties": {
@@ -121,10 +147,16 @@
       ]
     },
     {
-      "id": 4,
-      "type": "PreviewImage",
-      "pos": [1300, 200],
-      "size": [400, 400],
+      "id": 5,
+      "type": "VHS_VideoCombine",
+      "pos": [
+        1335.771484375,
+        376.669921875
+      ],
+      "size": [
+        225.3349609375,
+        238
+      ],
       "flags": {},
       "order": 3,
       "mode": 0,
@@ -132,29 +164,102 @@
         {
           "name": "images",
           "type": "IMAGE",
-          "link": 4
+          "link": 5
+        },
+        {
+          "name": "audio",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": null
+        },
+        {
+          "name": "meta_batch",
+          "shape": 7,
+          "type": "VHS_BatchManager",
+          "link": null
+        },
+        {
+          "name": "vae",
+          "shape": 7,
+          "type": "VAE",
+          "link": null
         }
       ],
-      "outputs": [],
+      "outputs": [
+        {
+          "name": "Filenames",
+          "type": "VHS_FILENAMES",
+          "links": null
+        }
+      ],
       "properties": {
-        "Node name for S&R": "PreviewImage"
+        "Node name for S&R": "VHS_VideoCombine"
       },
-      "widgets_values": []
+      "widgets_values": {
+        "frame_rate": 16,
+        "loop_count": 0,
+        "filename_prefix": "AnimateDiff",
+        "format": "image/gif",
+        "pingpong": false,
+        "save_output": true,
+        "videopreview": {
+          "hidden": false,
+          "paused": false,
+          "params": {}
+        }
+      }
     }
   ],
   "links": [
-    [1, 1, 0, 2, 0, "TENSOR"],
-    [2, 1, 1, 2, 1, "TENSOR"],
-    [3, 2, 0, 3, 0, "LATENT"],
-    [4, 3, 0, 4, 0, "IMAGE"]
+    [
+      1,
+      1,
+      0,
+      2,
+      0,
+      "TENSOR"
+    ],
+    [
+      2,
+      1,
+      1,
+      2,
+      1,
+      "TENSOR"
+    ],
+    [
+      3,
+      2,
+      0,
+      3,
+      0,
+      "LATENT"
+    ],
+    [
+      5,
+      3,
+      0,
+      5,
+      0,
+      "IMAGE"
+    ]
   ],
   "groups": [],
   "config": {},
   "extra": {
     "ds": {
       "scale": 0.8,
-      "offset": [0, 0]
-    }
+      "offset": [
+        0,
+        0
+      ]
+    },
+    "workflowRendererVersion": "LG",
+    "frontendVersion": "1.35.9",
+    "VHS_latentpreview": false,
+    "VHS_latentpreviewrate": 0,
+    "VHS_MetadataImage": true,
+    "VHS_KeepIntermediate": true
   },
   "version": 0.4
 }
